@@ -2,17 +2,19 @@
 
 **Run DeepSeek-V4.1-Flash on four DGX Spark / GB10 boxes by serving its Engram tables from NVMe instead of RAM.**
 
-> Status: **in service on the 4x GB10 cluster (2026-10-07).** DeepSeek-V4.1-Flash
+> Status: **in service on the 4x GB10 cluster (2026-10-08).** DeepSeek-V4.1-Flash
 > loads in 74.9 GiB per node with both Engram tables served from NVMe, answers
 > correctly (short prompts, a 12k-token needle-in-a-haystack, reasoning, tool
-> calls, `/v1/messages` with thinking), runs DSpark speculative decoding
-> (mean acceptance length 3–3.5 on prose and code) and serves 262k context.
-> Single-stream decode ~28 tok/s on prose and ~48 tok/s on code with DSpark;
-> ~74 tok/s aggregate at 4 streams. Getting there needed
-> `0002-sm120-deepseek-v41-page-sizes.patch`: V4.1 was not runnable on
-> sm_120 (GB10 / DGX Spark) with this vLLM nightly, and its DSpark drafter
-> loaded the wrong expert format on every platform — see
-> [docs/test-results.md](docs/test-results.md).
+> calls, `/v1/messages` with thinking), runs DSpark speculative decoding (mean
+> acceptance length ~4 on code) and serves 262k context. Measured: 31 tok/s
+> single-stream decode, 125 tok/s aggregate at 8 streams, 3,600 tok/s prefill
+> at 32k. The Engram rows are staged from NVMe before every step in 1–2 ms per
+> table. Getting there needed `0002-sm120-deepseek-v41-page-sizes.patch` (V4.1
+> was not runnable on sm_120 with this vLLM nightly, and its DSpark drafter
+> loaded the wrong expert format on every platform) and one Engram lesson —
+> vLLM's FULL CUDA graphs capture the lookup, so the host-side gather has to
+> live in the model runner's `prepare_inputs`, not in the forward. See
+> [docs/test-results.md](docs/test-results.md) and [docs/tuning.md](docs/tuning.md).
 
 ## The problem
 
@@ -43,10 +45,13 @@ So keep them on the NVMe:
 * The weight loader does not copy anything. This rank's row range of
   `engram.embed.weight` / `.scale` is memory-mapped straight from the
   safetensors shard (`MAP_PRIVATE`, `MADV_RANDOM`).
-* Per forward step, the rows the batch needs are gathered on the CPU through
-  the mapping — Linux's page cache in front of the NVMe — into pinned staging
-  buffers, copied to the device, and dequantized by the existing Triton lookup
-  kernel, now run against the dense gathered rows instead of the full table.
+* Before every step, the model runner (`DeepseekV41ModelState.prepare_inputs`)
+  hashes the batch with the model's own n-gram hash kernel, tells the kernel
+  which pages it needs (`MADV_WILLNEED`, so the NVMe sees all reads at once),
+  gathers this rank's rows into pinned memory and copies them into static
+  device buffers. The forward's lookup kernel only dequantizes those buffers
+  — which is what lets vLLM capture it in a CUDA graph and replay it after
+  each restage.
 * Memory per node drops from 122.8 GiB to ~76 GiB of weights plus activations,
   leaving room for a KV cache. The page cache uses whatever RAM is free and
   gives it back under pressure.
@@ -91,10 +96,12 @@ scripts/
   engram_disk_bench.py           # the NVMe gather benchmark above (no vLLM, no GPU)
   verify_disk_mapping.py         # bit-exact check of the storage layer vs. pread()
   node-v41.sh                    # per-node launcher used on the 4x GB10 ring cluster
-  dev/                           # the scripts that generated the patch hunks
+  bench_serving.py               # prefill / decode / NVMe benchmark against a running server
+  dev/                           # the scripts that generated the patch hunks, gather_bench.py
 docs/
   test-plan.md                   # the end-to-end validation plan
   test-results.md                # what happened on the 4x GB10 cluster (2026-10-07)
+  tuning.md                      # measurements and what is (not yet) optimized
 ```
 
 ### The patches
@@ -105,13 +112,13 @@ docs/
   and `disk_offload_threads: int = 64`, validated against `dp_shared_memory`
   and `use_thp`.
 * `vllm/models/deepseek_v41/common/engram.py` — a `DiskEngramStorage` class
-  (safetensors header parsing, per-rank mmap, pooled gather into pinned
-  buffers, no-op weight loader) and a `_lookup_from_disk` path in
-  `ParallelEngramEmbedding` that feeds the gathered rows to the unchanged
-  `_engram_lookup_kernel` in its sorted mode with identity destinations. A
-  plain (non-breakable) CUDA graph capture — vLLM's memory-sizing capture —
-  skips the host gather; the breakable capture used for replay runs it
-  eagerly every step.
+  (safetensors header parsing, per-rank mmap, `MADV_WILLNEED` + gather into
+  pinned buffers, static device staging buffers, no-op weight loader) and a
+  `_lookup_from_disk` path in `ParallelEngramEmbedding` that runs the
+  unchanged `_engram_lookup_kernel` over the staged rows in its sorted mode
+  with identity destinations. `VLLM_ENGRAM_TIMING=1` logs the staging cost.
+* `vllm/models/deepseek_v41/nvidia/model_state.py` — `prepare_inputs` stages
+  the rows for the padded batch before the forward (see "The idea").
 * `vllm/model_executor/model_loader/weight_utils.py` — the safetensors
   iterators hand the weight loader an empty placeholder for the registered
   Engram tensors instead of reading them, and with
@@ -201,13 +208,12 @@ Requirements and caveats:
 
 ## Roadmap
 
-1. Measure properly: decode and prefill against V4-Flash on the same cluster
-   and the in-memory numbers NVIDIA publishes for GB300; page-cache hit rates
-   on real coding traffic. First numbers above.
-2. Prefetch: the hash ids are known before the decoder runs, so the gather for
-   step *t+1* can start while step *t* computes (and for DSpark drafts).
-3. Prefill throughput: `--max-num-batched-tokens` is 2048 in the launcher
-   (a 12k-token prompt takes ~10 s); larger chunks need a memory check.
+1. Measure on real coding traffic: cold-vs-warm gather share (the timing log),
+   page-cache hit rate, `--gpu-memory-utilization 0.75` as a page-cache trade.
+2. Overlap the DSpark verification batch's staging with the drafter; the
+   plain decode step cannot prefetch (the next token is the step's output).
+3. `--max-num-batched-tokens 4096`, DSpark `num_speculative_tokens`,
+   torch.compile, FlashInfer autotune — see [docs/tuning.md](docs/tuning.md).
 4. Engram DP sharding support (`engram_dp_size > 1`).
 5. Upstream: the `vl_model.py` streaming load, the null-block zeroing and the
    DSpark expert-format fix are bugs on their own; the per-layer block sizes

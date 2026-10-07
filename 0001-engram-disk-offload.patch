@@ -48,14 +48,15 @@
                  and not parallel_config.enable_elastic_ep
              )
 --- a/vllm/models/deepseek_v41/common/engram.py	2026-10-07 19:20:54.738610540 +0200
-+++ b/vllm/models/deepseek_v41/common/engram.py	2026-10-07 19:20:57.822848068 +0200
-@@ -35,10 +35,13 @@
++++ b/vllm/models/deepseek_v41/common/engram.py	2026-10-08 01:18:11.764800430 +0200
+@@ -35,10 +35,14 @@
  """
  
  import ctypes
 +import json
  import mmap
  import os
++import time
 +import struct
  import tempfile
  import weakref
@@ -63,7 +64,7 @@
  from contextlib import ExitStack
  
  import numpy as np
-@@ -64,6 +67,7 @@
+@@ -64,6 +68,7 @@
  from vllm.logger import init_logger
  from vllm.model_executor.layers.linear import ColumnParallelLinear
  from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -71,7 +72,17 @@
  from vllm.model_executor.utils import set_weight_attrs
  from vllm.platforms import current_platform
  from vllm.triton_utils import tl, triton
-@@ -911,6 +915,211 @@
+@@ -72,6 +77,9 @@
+ 
+ logger = init_logger(__name__)
+ 
++# VLLM_ENGRAM_TIMING=1 logs the host-side cost of the NVMe gathers.
++_ENGRAM_TIMING = os.environ.get("VLLM_ENGRAM_TIMING", "0") == "1"
++
+ # Cache value for tokens that take no part in an n-gram (image spans).
+ DEAD_ID = -1
+ 
+@@ -911,6 +919,330 @@
      return tensor
  
  
@@ -147,6 +158,7 @@
 +        register_placeholder_weight(scale_name)
 +        self._mappings: list[mmap.mmap] = []
 +        self._paths: list[str] = []
++        self._view_offsets: list[int] = []
 +        self.weight_np = self._map_rows(model_path, weight_name, dim)
 +        self.scales_np = self._map_rows(model_path, scale_name, self.scale_dim)
 +        self._pool = ThreadPoolExecutor(threads, thread_name_prefix="engram-disk")
@@ -154,6 +166,17 @@
 +        self._weight_buf: torch.Tensor | None = None
 +        self._scales_buf: torch.Tensor | None = None
 +        self._copy_done: torch.cuda.Event | None = None
++        self._timing: dict[str, tuple[int, float, int, float, float]] = {}
++        self._timing_calls = 0
++        self._ids_buf: torch.Tensor | None = None
++        # Static device buffers the lookup kernel reads. CUDA graphs capture
++        # the kernel on them, and `stage()` refills them before every step
++        # (from the model runner's prepare_inputs, outside the graph).
++        self._dev_capacity = 0
++        self._dev_weight: torch.Tensor | None = None
++        self._dev_scales: torch.Tensor | None = None
++        self._dev_ids: torch.Tensor | None = None
++        self._dev_dst: torch.Tensor | None = None
 +        self.files = sorted({os.path.basename(m) for m in self._paths})
 +
 +    def _map_rows(self, model_path: str, name: str, width: int) -> np.ndarray:
@@ -195,6 +218,7 @@
 +        mapping.madvise(mmap.MADV_RANDOM)
 +        self._mappings.append(mapping)
 +        self._paths.append(path)
++        self._view_offsets.append(offset - page_offset)
 +        view = np.frombuffer(mapping, dtype=np.uint8, count=length, offset=offset - page_offset)
 +        return view.reshape(self.num_rows, width)
 +
@@ -238,6 +262,93 @@
 +        assert self._weight_buf is not None and self._scales_buf is not None
 +        return self._weight_buf[:rows], self._scales_buf[:rows]
 +
++    def _ensure_static(self, rows: int, device: torch.device) -> None:
++        if self._dev_weight is not None and rows <= self._dev_capacity:
++            return
++        assert not torch.cuda.is_current_stream_capturing(), (
++            "engram staging buffers must be sized before CUDA graph capture "
++            f"(need {rows} rows, have {self._dev_capacity})"
++        )
++        cap = max(rows, 2 * self._dev_capacity)
++        self._dev_weight = torch.empty(
++            (cap, self.dim), dtype=torch.float8_e4m3fn, device=device
++        )
++        self._dev_scales = torch.empty(
++            (cap, self.scale_dim), dtype=torch.uint8, device=device
++        )
++        self._dev_ids = torch.full((cap,), -1, dtype=torch.int64, device=device)
++        self._dev_dst = torch.arange(cap, dtype=torch.int32, device=device)
++        self._dev_capacity = cap
++
++    def staged(
++        self, rows: int, device: torch.device
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        """(rows, scales, ids, dst) views of the static buffers for `rows`."""
++        self._ensure_static(rows, device)
++        assert self._dev_weight is not None and self._dev_scales is not None
++        assert self._dev_ids is not None and self._dev_dst is not None
++        return (
++            self._dev_weight[:rows],
++            self._dev_scales[:rows],
++            self._dev_ids[:rows],
++            self._dev_dst[:rows],
++        )
++
++    def stage(self, local_rows: np.ndarray, device: torch.device) -> None:
++        """Gather `local_rows` into the static device buffers for this step.
++
++        Rows outside this rank's range (other ranks' heads, DEAD_ID) get id -1
++        and are written as zeros by the lookup kernel.
++        """
++        t0 = time.perf_counter() if _ENGRAM_TIMING else 0.0
++        rows = int(local_rows.shape[0])
++        self._ensure_static(rows, device)
++        owned = (local_rows >= 0) & (local_rows < self.num_rows)
++        weight_buf, scales_buf = self._buffers(rows)
++        if self._ids_buf is None or self._ids_buf.shape[0] < self._capacity:
++            self._ids_buf = torch.empty(
++                (self._capacity,), dtype=torch.int64, pin_memory=True
++            )
++        ids_buf = self._ids_buf[:rows]
++        t1 = time.perf_counter() if _ENGRAM_TIMING else 0.0
++        self._gather_into(local_rows, weight_buf.numpy(), scales_buf.numpy())
++        t2 = time.perf_counter() if _ENGRAM_TIMING else 0.0
++        np.copyto(ids_buf.numpy(), np.where(owned, np.arange(rows), -1))
++        assert self._dev_weight is not None and self._dev_scales is not None
++        assert self._dev_ids is not None
++        self._dev_weight[:rows].copy_(
++            weight_buf.view(torch.float8_e4m3fn), non_blocking=True
++        )
++        self._dev_scales[:rows].copy_(scales_buf, non_blocking=True)
++        self._dev_ids[:rows].copy_(ids_buf, non_blocking=True)
++        if self._copy_done is None:
++            self._copy_done = torch.cuda.Event()
++        self._copy_done.record(torch.cuda.current_stream())
++        if _ENGRAM_TIMING:
++            self.record_timing(rows, time.perf_counter() - t0, t1 - t0, t2 - t1)
++
++    def record_timing(
++        self, rows: int, seconds: float, wait: float = 0.0, gather: float = 0.0
++    ) -> None:
++        """VLLM_ENGRAM_TIMING=1: log the host-side gather cost every 200 lookups,
++        split by batch size (decode steps gather a few hundred rows, prefill
++        chunks tens of thousands)."""
++        bucket = "decode" if rows <= 4096 else "prefill"
++        n, t, r, w, g = self._timing.get(bucket, (0, 0.0, 0, 0.0, 0.0))
++        self._timing[bucket] = (n + 1, t + seconds, r + rows, w + wait, g + gather)
++        self._timing_calls += 1
++        if self._timing_calls % 200 == 0:
++            parts = []
++            for b, (n, t, r, w, g) in sorted(self._timing.items()):
++                if n:
++                    parts.append(
++                        f"{b}: {n} lookups, {1e3 * t / n:.2f} ms avg "
++                        f"(wait {1e3 * w / n:.2f}, gather {1e3 * g / n:.2f}), "
++                        f"{r / n:.0f} rows avg, {r / max(g, 1e-9) / 1e3:.0f}k rows/s"
++                    )
++            logger.info("Engram disk gather [%s]: %s", self.weight_name, "; ".join(parts))
++            self._timing = {}
++
 +    def device_buffers(
 +        self, rows: int, device: torch.device
 +    ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -254,11 +365,36 @@
 +        rows the caller masks out) to `device` as (fp8 rows, ue8m0 scales)."""
 +        rows = int(local_rows.shape[0])
 +        weight_buf, scales_buf = self._buffers(rows)
-+        weight_out, scales_out = weight_buf.numpy(), scales_buf.numpy()
++        self._gather_into(local_rows, weight_buf.numpy(), scales_buf.numpy())
++        weight_dev = weight_buf.to(device, non_blocking=True).view(torch.float8_e4m3fn)
++        scales_dev = scales_buf.to(device, non_blocking=True)
++        if self._copy_done is None:
++            self._copy_done = torch.cuda.Event()
++        self._copy_done.record(torch.cuda.current_stream())
++        return weight_dev, scales_dev
++
++    def _gather_into(
++        self, local_rows: np.ndarray, weight_out: np.ndarray, scales_out: np.ndarray
++    ) -> None:
++        rows = int(local_rows.shape[0])
 +        local_rows = np.clip(local_rows, 0, self.num_rows - 1)
-+        # One row per fault: spread the faults over the pool so the NVMe sees
-+        # a deep queue. np.take releases the GIL while it copies.
-+        splits = min(self.threads, max(1, rows // 8))
++        # Tell the kernel about every page first (MADV_WILLNEED issues the
++        # reads asynchronously, so the NVMe sees them all at once), then copy.
++        # Faulting the rows one by one from a thread pool instead leaves the
++        # device idle between reads: 56 cold rows took 2-3 ms that way and
++        # ~0.7 ms this way; 2048 rows 20 ms vs 10 ms.
++        uniq = np.unique(local_rows)
++        for mapping, base, width in (
++            (self._mappings[0], self._view_offsets[0], self.dim),
++            (self._mappings[1], self._view_offsets[1], self.scale_dim),
++        ):
++            starts = base + uniq * width
++            first = starts & ~4095
++            last = (starts + width - 1) & ~4095
++            pages = np.unique(np.concatenate([first, last]))
++            for page in pages.tolist():
++                mapping.madvise(mmap.MADV_WILLNEED, page, 4096)
++        splits = 1 if rows <= 1024 else min(8, rows // 512)
 +        bounds = np.linspace(0, rows, splits + 1, dtype=np.int64)
 +
 +        def work(part: int) -> None:
@@ -272,18 +408,12 @@
 +            work(0)
 +        else:
 +            list(self._pool.map(work, range(splits)))
-+        weight_dev = weight_buf.to(device, non_blocking=True).view(torch.float8_e4m3fn)
-+        scales_dev = scales_buf.to(device, non_blocking=True)
-+        if self._copy_done is None:
-+            self._copy_done = torch.cuda.Event()
-+        self._copy_done.record(torch.cuda.current_stream())
-+        return weight_dev, scales_dev
 +
 +
  class ParallelEngramEmbedding(nn.Module):
      """Hash heads with FP8 rows and per-block E8M0 scales.
  
-@@ -931,6 +1140,9 @@
+@@ -931,6 +1263,9 @@
          cpu_offload: bool = False,
          dp_shared_memory: bool = False,
          use_thp: bool = False,
@@ -293,7 +423,7 @@
      ) -> None:
          super().__init__()
          assert head_sizes and all(size > 0 for size in head_sizes)
-@@ -938,6 +1150,19 @@
+@@ -938,6 +1273,19 @@
          self.cpu_offload = cpu_offload
          self.dp_shared_memory = dp_shared_memory
          self.use_thp = use_thp
@@ -313,7 +443,7 @@
          self.dp_size = get_engram_dp_size()
          if dp_shared_memory:
              if not cpu_offload:
-@@ -985,7 +1210,17 @@
+@@ -985,7 +1333,17 @@
                      "engram_vocab_start": self.vocab_start_idx,
                  },
              )
@@ -332,7 +462,7 @@
              # Constant dummy values avoid randomizing huge CPU lookup tables.
              set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
              # The ue8m0 encoding of scale 1.0 is exponent byte 127.
-@@ -1005,6 +1240,22 @@
+@@ -1005,6 +1363,22 @@
          return self.tp_size * self.dp_size, engram_head_shard_rank()
  
      def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -355,7 +485,7 @@
          if self.dp_shared_memory:
              group = get_engram_dp_group()
              assert group is not None
-@@ -1089,6 +1340,9 @@
+@@ -1089,6 +1463,9 @@
          rows = indices.shape[0] * self.part_n_hash_cols
          if not rows:
              return
@@ -365,42 +495,54 @@
          weight, scales = self._storage()
          ids_stride_t, ids_stride_h = indices.stride()
          sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
-@@ -1133,6 +1387,61 @@
+@@ -1133,6 +1510,73 @@
              SORTED=sort,
          )
  
++    def _local_rows(self, indices: torch.Tensor) -> np.ndarray:
++        head_end = self.head_start + self.part_n_hash_cols
++        local = indices[:, self.head_start : head_end] - self.vocab_start_idx
++        if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
++            local = nn.functional.pad(local, (0, pad), value=-1)
++        return local.reshape(-1).to("cpu", dtype=torch.int64).numpy()
++
++    def prefetch_rows(self, indices: torch.Tensor) -> None:
++        """Stage this step's rows from storage (called by the model runner
++        before the forward, outside any CUDA graph).
++
++        `indices` is [num_tokens, n_hash_cols] for the padded batch the
++        forward will see, so the staged rows line up with the kernel's.
++        """
++        assert self._disk is not None
++        if indices.shape[0] == 0:
++            return
++        self._disk.stage(self._local_rows(indices), indices.device)
++
++    def local_rows(self, indices: torch.Tensor) -> torch.Tensor:
++        """This rank's rows for `indices` ([num_tokens, n_hash_cols]) as a
++        flat device tensor of local indices (-1 for other ranks' heads)."""
++        head_end = self.head_start + self.part_n_hash_cols
++        local = indices[:, self.head_start : head_end] - self.vocab_start_idx
++        if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
++            local = nn.functional.pad(local, (0, pad), value=-1)
++        return local.reshape(-1)
++
++    def stage_local_rows(self, local_np: np.ndarray, device: torch.device) -> None:
++        assert self._disk is not None
++        if local_np.shape[0]:
++            self._disk.stage(local_np, device)
++
 +    def _lookup_from_disk(
 +        self, indices: torch.Tensor, out: torch.Tensor, rows: int, background: bool
 +    ) -> None:
-+        """Gather this rank's rows on the CPU, then dequantize them on the device.
++        """Dequantize the staged rows into `out`.
 +
-+        Runs eagerly (the callers break CUDA graph capture around lookups), so
-+        the device-to-host copy of the hash ids is an ordinary sync.
++        The rows were staged by `prefetch_rows` for this step; the kernel only
++        reads the static buffers, so it can be captured in a CUDA graph and
++        replayed after every restage. Masked rows (id -1) come out as zeros.
 +        """
 +        assert self._disk is not None
-+        if torch.cuda.is_current_stream_capturing():
-+            # A plain (non-breakable) capture, e.g. the one that sizes CUDA
-+            # graph memory at startup, cannot carry host work or syncs. Stage
-+            # nothing and mask every row; the breakable capture used for
-+            # replay runs this lookup eagerly on every step.
-+            weight, scales = self._disk.device_buffers(rows, indices.device)
-+            ids = torch.full((rows,), -1, dtype=torch.int64, device=indices.device)
-+        else:
-+            head_end = self.head_start + self.part_n_hash_cols
-+            local = indices[:, self.head_start : head_end] - self.vocab_start_idx
-+            if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
-+                local = nn.functional.pad(local, (0, pad), value=-1)
-+            local_np = local.reshape(-1).to("cpu", dtype=torch.int64).numpy()
-+            owned = (local_np >= 0) & (local_np < self.part_num_embeddings)
-+            weight, scales = self._disk.gather(local_np, indices.device)
-+            # The gathered rows form a dense table of `rows` entries in output
-+            # order, so the sorted-lookup path is run against it with identity
-+            # destinations; masked rows (DEAD_ID, other ranks' heads) read as
-+            # -1 and are written as zeros, exactly as in the in-memory path.
-+            ids = torch.from_numpy(np.where(owned, np.arange(rows), -1)).to(
-+                indices.device, non_blocking=True
-+            )
-+        dst = torch.arange(rows, dtype=torch.int32, device=indices.device)
++        weight, scales, ids, dst = self._disk.staged(rows, indices.device)
 +        tiles = triton.cdiv(rows, 16)
 +        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
 +        _engram_lookup_kernel[(grid,)](
@@ -427,7 +569,7 @@
      def forward(self, indices: torch.Tensor) -> torch.Tensor:
          """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
          bf16, gathered from all shards for this replica's tokens."""
-@@ -1379,6 +1688,7 @@
+@@ -1379,6 +1823,7 @@
      ) -> ParallelEngramEmbedding:
          engram_config = get_current_vllm_config().engram_config
          assert engram_config is not None
@@ -435,7 +577,7 @@
          return ParallelEngramEmbedding(
              layout.num_embeddings[layer_hash_index],
              layout.head_dim,
-@@ -1386,6 +1696,14 @@
+@@ -1386,6 +1831,14 @@
              cpu_offload=engram_config.cpu_offload,
              dp_shared_memory=bool(engram_config.dp_shared_memory),
              use_thp=engram_config.use_thp,
@@ -582,3 +724,93 @@
          # The child's load_weights already ran its post-load finalization.
          self._weights_finalized = True
          return loaded_params
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py	2026-10-08 00:48:50.216435462 +0200
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py	2026-10-08 01:02:27.685249145 +0200
+@@ -208,6 +208,10 @@
+         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
+             model, "decoder_replay_layers", None
+         )
++        # (hash state, Engram layers with disk-offloaded tables), resolved on
++        # first use; () when the model has none.
++        self._engram_disk: tuple | None = None
++        self._engram_pool = None
+         if self.decoder_replay_layers is not None:
+             # Requests whose every prompt row is read (prompt logprobs) never trim.
+             self._keeps_rows_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
+@@ -260,8 +264,76 @@
+             BLOCK_DEPTH=triton.next_power_of_2(depth),
+         )
+         model_inputs["lookback_token_ids"] = window
++        self._stage_engram_rows(input_batch, window)
+         return model_inputs
+ 
++    def _stage_engram_rows(
++        self, input_batch: InputBatch, lookback_token_ids: torch.Tensor
++    ) -> None:
++        """Engram disk offload: hash this step's tokens and stage their rows
++        from storage before the forward runs (CUDA graphs replay the lookup
++        kernel on the staged buffers, so the host work has to happen here)."""
++        if self._engram_disk is None:
++            from vllm.models.deepseek_v41.common.engram import (
++                Engram,
++                NgramHashState,
++            )
++
++            hash_state = next(
++                (m for m in self.model.modules() if isinstance(m, NgramHashState)),
++                None,
++            )
++            layers = [
++                m
++                for m in self.model.modules()
++                if isinstance(m, Engram)
++                and getattr(m.embed_tokens, "_disk", None) is not None
++            ]
++            self._engram_disk = (hash_state, layers) if hash_state and layers else ()
++        if not self._engram_disk:
++            return
++        hash_state, layers = self._engram_disk
++        from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
++        from vllm.models.deepseek_v41.common.mm_preprocess import image_sentinel_mask
++
++        num_tokens = input_batch.num_tokens_after_padding
++        input_ids = input_batch.input_ids[:num_tokens]
++        positions = input_batch.positions[:num_tokens]
++        query_start_loc = input_batch.query_start_loc[: input_batch.num_reqs + 1]
++        hashes = hash_state(
++            input_ids,
++            positions,
++            query_start_loc,
++            image_sentinel_mask(input_ids),
++            lookback_token_ids,
++            image_sentinel_mask(lookback_token_ids),
++            None,
++            None,
++        )
++        hashes = gather_engram_hashes(hashes)
++        # One device-to-host copy for all tables, then the gathers run side by
++        # side in the tables' thread pools.
++        locals_dev = [
++            engram.embed_tokens.local_rows(hashes[:, engram.layer_hash_index])
++            for engram in layers
++        ]
++        locals_np = torch.stack(locals_dev).to("cpu", dtype=torch.int64).numpy()
++        if len(layers) == 1:
++            layers[0].embed_tokens.stage_local_rows(locals_np[0], hashes.device)
++            return
++        import concurrent.futures
++
++        if self._engram_pool is None:
++            self._engram_pool = concurrent.futures.ThreadPoolExecutor(len(layers))
++        futures = [
++            self._engram_pool.submit(
++                engram.embed_tokens.stage_local_rows, locals_np[i], hashes.device
++            )
++            for i, engram in enumerate(layers)
++        ]
++        for f in futures:
++            f.result()
++
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+         if self.lookback_token_ids is not None:
