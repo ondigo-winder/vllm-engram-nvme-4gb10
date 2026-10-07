@@ -41,7 +41,7 @@ start)
     "$IMAGE" /model --served-model-name "$SERVED_NAME" deepseek-v4-flash \
     --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" \
     --master-addr "$HEAD_IP" --master-port 29521 --distributed-executor-backend mp \
-    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$GPU_UTIL" --max-num-batched-tokens "${BATCH_TOKENS:-8192}" --max-num-seqs "${MAX_SEQS:-32}" \
+    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$GPU_UTIL" --max-num-batched-tokens "${BATCH_TOKENS:-2048}" --max-num-seqs "${MAX_SEQS:-16}" \
     --trust-remote-code --language-model-only \
     --kernel-config '{"enable_flashinfer_autotune":false}' \
     --chat-template /root/.cache/no-merge.jinja \
