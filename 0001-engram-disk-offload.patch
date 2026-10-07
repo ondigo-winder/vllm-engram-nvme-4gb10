@@ -1,0 +1,417 @@
+--- a/vllm/config/engram.py	2026-10-07 16:39:18.722263309 +0200
++++ b/vllm/config/engram.py	2026-10-07 16:39:18.741477037 +0200
+@@ -55,6 +55,22 @@
+     effort, falls back to ordinary pinned pages). Prefaulting the tables at
+     startup takes longer. Requires cpu_offload without dp_shared_memory."""
+ 
++    disk_offload: bool = False
++    """Keep the Engram tables on local storage instead of in pinned host
++    memory. This rank's row range of ``engram.embed.weight`` / ``.scale`` is
++    memory-mapped straight from the safetensors shard of a local checkpoint
++    directory, and the rows a forward step needs are gathered on the CPU and
++    copied to the device. Meant for unified-memory machines (DGX Spark / GB10,
++    GB200) where pinned host memory and GPU memory are one pool, so the
++    offloaded tables would otherwise still cost device memory. Needs a fast
++    local NVMe; requires ``cpu_offload=True``; incompatible with
++    ``dp_shared_memory`` and ``use_thp``."""
++
++    disk_offload_threads: int = 64
++    """Gather threads for ``disk_offload``. Page faults on the mapped tables
++    overlap across threads, so this bounds the random-read queue depth sent to
++    the storage device."""
++
+     @model_validator(mode="after")
+     def _validate_shared_memory(self) -> Self:
+         if self.dp_shared_memory and not self.cpu_offload:
+@@ -63,6 +79,15 @@
+             raise ValueError(
+                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
+             )
++        if self.disk_offload:
++            if not self.cpu_offload:
++                raise ValueError("disk_offload requires cpu_offload=True")
++            if self.dp_shared_memory or self.use_thp:
++                raise ValueError(
++                    "disk_offload is incompatible with dp_shared_memory and use_thp"
++                )
++            if self.disk_offload_threads < 1:
++                raise ValueError("disk_offload_threads must be >= 1")
+         return self
+ 
+     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
+@@ -88,6 +113,7 @@
+             self.dp_shared_memory = (
+                 self.cpu_offload
+                 and not self.use_thp
++                and not self.disk_offload
+                 and parallel_config.data_parallel_size > 1
+                 and not parallel_config.enable_elastic_ep
+             )
+--- a/vllm/models/deepseek_v41/common/engram.py	2026-10-07 16:39:18.722051715 +0200
++++ b/vllm/models/deepseek_v41/common/engram.py	2026-10-07 16:41:33.606031796 +0200
+@@ -35,10 +35,13 @@
+ """
+ 
+ import ctypes
++import json
+ import mmap
+ import os
++import struct
+ import tempfile
+ import weakref
++from concurrent.futures import ThreadPoolExecutor
+ from contextlib import ExitStack
+ 
+ import numpy as np
+@@ -911,6 +914,192 @@
+     return tensor
+ 
+ 
++_SAFETENSORS_ITEMSIZE = {
++    "F8_E4M3": 1,
++    "F8_E5M2": 1,
++    "F8_E8M0": 1,
++    "U8": 1,
++    "I8": 1,
++    "BF16": 2,
++    "F16": 2,
++    "F32": 4,
++}
++
++
++def _safetensors_tensor_span(path: str) -> tuple[int, dict]:
++    """The data-section offset and tensor header of a safetensors file."""
++    with open(path, "rb") as file:
++        (header_len,) = struct.unpack("<Q", file.read(8))
++        header = json.loads(file.read(header_len))
++    return 8 + header_len, header
++
++
++def _resolve_checkpoint_tensor(model_path: str, name: str) -> str:
++    """The safetensors shard that holds `name`, from the index or a single file."""
++    if not os.path.isdir(model_path):
++        raise ValueError(
++            "Engram disk_offload needs a local checkpoint directory, got "
++            f"{model_path!r}"
++        )
++    index = os.path.join(model_path, "model.safetensors.index.json")
++    if os.path.isfile(index):
++        with open(index) as file:
++            weight_map = json.load(file)["weight_map"]
++        if name not in weight_map:
++            raise KeyError(f"{name} is not in {index}")
++        return os.path.join(model_path, weight_map[name])
++    single = os.path.join(model_path, "model.safetensors")
++    if os.path.isfile(single):
++        return single
++    raise FileNotFoundError(f"no safetensors index or file in {model_path}")
++
++
++class DiskEngramStorage:
++    """This rank's rows of an Engram table, memory-mapped from the checkpoint.
++
++    Nothing is copied at load time: the weight loader only checks that the
++    checkpoint tensor matches the mapping. Each lookup gathers its rows on the
++    CPU through the mapping (page cache in front of the NVMe; MADV_RANDOM so a
++    264-byte row does not drag a 128 KiB read-around window in with it) into
++    pinned staging buffers, and the existing lookup kernel dequantizes those
++    rows on the device.
++    """
++
++    def __init__(
++        self,
++        model_path: str,
++        weight_name: str,
++        scale_name: str,
++        vocab_start: int,
++        num_rows: int,
++        dim: int,
++        block_size: int,
++        threads: int,
++    ) -> None:
++        self.weight_name, self.scale_name = weight_name, scale_name
++        self.vocab_start, self.num_rows = vocab_start, num_rows
++        self.dim, self.scale_dim = dim, dim // block_size
++        self.threads = threads
++        self._mappings: list[mmap.mmap] = []
++        self._paths: list[str] = []
++        self.weight_np = self._map_rows(model_path, weight_name, dim)
++        self.scales_np = self._map_rows(model_path, scale_name, self.scale_dim)
++        self._pool = ThreadPoolExecutor(threads, thread_name_prefix="engram-disk")
++        self._capacity = 0
++        self._weight_buf: torch.Tensor | None = None
++        self._scales_buf: torch.Tensor | None = None
++        self._copy_done: torch.cuda.Event | None = None
++        self.files = sorted({os.path.basename(m) for m in self._paths})
++
++    def _map_rows(self, model_path: str, name: str, width: int) -> np.ndarray:
++        path = _resolve_checkpoint_tensor(model_path, name)
++        data_start, header = _safetensors_tensor_span(path)
++        info = header[name]
++        itemsize = _SAFETENSORS_ITEMSIZE[info["dtype"]]
++        shape = info["shape"]
++        row_bytes = int(np.prod(shape[1:])) * itemsize
++        if row_bytes != width:
++            raise ValueError(
++                f"{name}: checkpoint rows are {row_bytes} B, expected {width} B"
++            )
++        if self.vocab_start + self.num_rows > shape[0]:
++            raise ValueError(
++                f"{name}: shard [{self.vocab_start}, "
++                f"{self.vocab_start + self.num_rows}) exceeds {shape[0]} rows"
++            )
++        start, end = info["data_offsets"]
++        offset = data_start + start + self.vocab_start * width
++        length = self.num_rows * width
++        assert offset + length <= data_start + end
++        # Map from a page boundary; PROT_WRITE on MAP_PRIVATE gives a writable
++        # (copy-on-write, never written) buffer, which keeps torch from
++        # warning about read-only NumPy memory.
++        page_offset = offset - offset % mmap.ALLOCATIONGRANULARITY
++        fd = os.open(path, os.O_RDONLY)
++        try:
++            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
++            mapping = mmap.mmap(
++                fd,
++                offset - page_offset + length,
++                flags=mmap.MAP_PRIVATE,
++                prot=mmap.PROT_READ | mmap.PROT_WRITE,
++                offset=page_offset,
++            )
++        finally:
++            os.close(fd)
++        mapping.madvise(mmap.MADV_RANDOM)
++        self._mappings.append(mapping)
++        self._paths.append(path)
++        view = np.frombuffer(mapping, dtype=np.uint8, count=length, offset=offset - page_offset)
++        return view.reshape(self.num_rows, width)
++
++    def parameters(self) -> tuple[torch.Tensor, torch.Tensor]:
++        """CPU tensors aliasing the mapped rows (never read by the device)."""
++        return (
++            torch.from_numpy(self.weight_np).view(torch.float8_e4m3fn),
++            torch.from_numpy(self.scales_np),
++        )
++
++    def load_weight(self, param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
++        """Nothing to copy: only check that the checkpoint agrees with the mapping."""
++        expected = (self.num_rows, param.shape[1])
++        if tuple(param.shape) != expected:
++            raise RuntimeError(f"disk Engram param {tuple(param.shape)} != {expected}")
++        if loaded_weight.shape[0] < self.vocab_start + self.num_rows:
++            raise RuntimeError(
++                f"checkpoint tensor has {loaded_weight.shape[0]} rows, mapping "
++                f"needs {self.vocab_start + self.num_rows}"
++            )
++
++    def _buffers(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
++        if self._copy_done is not None:
++            # The previous step's host-to-device copies must finish before the
++            # staging buffers are overwritten.
++            self._copy_done.synchronize()
++        if rows > self._capacity:
++            self._capacity = max(rows, 2 * self._capacity)
++            self._weight_buf = torch.empty(
++                (self._capacity, self.dim), dtype=torch.uint8, pin_memory=True
++            )
++            self._scales_buf = torch.empty(
++                (self._capacity, self.scale_dim), dtype=torch.uint8, pin_memory=True
++            )
++        assert self._weight_buf is not None and self._scales_buf is not None
++        return self._weight_buf[:rows], self._scales_buf[:rows]
++
++    def gather(
++        self, local_rows: np.ndarray, device: torch.device
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Fetch `local_rows` (indices into this rank's range, any value for
++        rows the caller masks out) to `device` as (fp8 rows, ue8m0 scales)."""
++        rows = int(local_rows.shape[0])
++        weight_buf, scales_buf = self._buffers(rows)
++        weight_out, scales_out = weight_buf.numpy(), scales_buf.numpy()
++        local_rows = np.clip(local_rows, 0, self.num_rows - 1)
++        # One row per fault: spread the faults over the pool so the NVMe sees
++        # a deep queue. np.take releases the GIL while it copies.
++        splits = min(self.threads, max(1, rows // 8))
++        bounds = np.linspace(0, rows, splits + 1, dtype=np.int64)
++
++        def work(part: int) -> None:
++            # Slices (not index arrays) so `out=` writes into the staging buffer.
++            a, b = int(bounds[part]), int(bounds[part + 1])
++            if b > a:
++                np.take(self.weight_np, local_rows[a:b], axis=0, out=weight_out[a:b])
++                np.take(self.scales_np, local_rows[a:b], axis=0, out=scales_out[a:b])
++
++        if splits == 1:
++            work(0)
++        else:
++            list(self._pool.map(work, range(splits)))
++        weight_dev = weight_buf.to(device, non_blocking=True).view(torch.float8_e4m3fn)
++        scales_dev = scales_buf.to(device, non_blocking=True)
++        if self._copy_done is None:
++            self._copy_done = torch.cuda.Event()
++        self._copy_done.record(torch.cuda.current_stream())
++        return weight_dev, scales_dev
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """Hash heads with FP8 rows and per-block E8M0 scales.
+ 
+@@ -931,6 +1120,9 @@
+         cpu_offload: bool = False,
+         dp_shared_memory: bool = False,
+         use_thp: bool = False,
++        disk_offload: bool = False,
++        disk_offload_threads: int = 64,
++        checkpoint_names: tuple[str, str] | None = None,
+     ) -> None:
+         super().__init__()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+@@ -938,6 +1130,19 @@
+         self.cpu_offload = cpu_offload
+         self.dp_shared_memory = dp_shared_memory
+         self.use_thp = use_thp
++        self.disk_offload = disk_offload
++        self._disk: DiskEngramStorage | None = None
++        if disk_offload:
++            if not cpu_offload or dp_shared_memory or use_thp:
++                raise ValueError(
++                    "disk_offload requires cpu_offload without dp_shared_memory/use_thp"
++                )
++            if checkpoint_names is None:
++                raise ValueError("disk_offload needs the checkpoint tensor names")
++            if get_engram_dp_size() > 1:
++                raise ValueError("disk_offload does not support Engram DP sharding yet")
++        self._disk_offload_threads = disk_offload_threads
++        self._checkpoint_names = checkpoint_names
+         self.dp_size = get_engram_dp_size()
+         if dp_shared_memory:
+             if not cpu_offload:
+@@ -985,7 +1190,17 @@
+                     "engram_vocab_start": self.vocab_start_idx,
+                 },
+             )
+-        if cpu_offload:
++        if self._disk is not None:
++            logger.info(
++                "Engram table mapped from local storage (%s): %d rows x %d, "
++                "%.2f GiB, %d gather threads",
++                ", ".join(self._disk.files),
++                self.part_num_embeddings,
++                dim,
++                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
++                disk_offload_threads,
++            )
++        elif cpu_offload:
+             # Constant dummy values avoid randomizing huge CPU lookup tables.
+             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
+             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
+@@ -1005,6 +1220,22 @@
+         return self.tp_size * self.dp_size, engram_head_shard_rank()
+ 
+     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
++        if self.disk_offload:
++            assert self._checkpoint_names is not None
++            weight_name, scale_name = self._checkpoint_names
++            storage = DiskEngramStorage(
++                get_current_vllm_config().model_config.model,
++                weight_name,
++                scale_name,
++                self.vocab_start_idx,
++                self.part_num_embeddings,
++                self.dim,
++                self.block_size,
++                self._disk_offload_threads,
++            )
++            self._disk = storage
++            self._weight_loader = storage.load_weight
++            return storage.parameters()
+         if self.dp_shared_memory:
+             group = get_engram_dp_group()
+             assert group is not None
+@@ -1089,6 +1320,9 @@
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if self._disk is not None:
++            self._lookup_from_disk(indices, out, rows, background)
++            return
+         weight, scales = self._storage()
+         ids_stride_t, ids_stride_h = indices.stride()
+         sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
+@@ -1133,6 +1367,53 @@
+             SORTED=sort,
+         )
+ 
++    def _lookup_from_disk(
++        self, indices: torch.Tensor, out: torch.Tensor, rows: int, background: bool
++    ) -> None:
++        """Gather this rank's rows on the CPU, then dequantize them on the device.
++
++        Runs eagerly (the callers break CUDA graph capture around lookups), so
++        the device-to-host copy of the hash ids is an ordinary sync.
++        """
++        assert self._disk is not None
++        head_end = self.head_start + self.part_n_hash_cols
++        local = indices[:, self.head_start : head_end] - self.vocab_start_idx
++        if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
++            local = nn.functional.pad(local, (0, pad), value=-1)
++        local_np = local.reshape(-1).to("cpu", dtype=torch.int64).numpy()
++        owned = (local_np >= 0) & (local_np < self.part_num_embeddings)
++        weight, scales = self._disk.gather(local_np, indices.device)
++        # The gathered rows form a dense table of `rows` entries in output
++        # order, so the sorted-lookup path is run against it with identity
++        # destinations; masked rows (DEAD_ID, other ranks' heads) read as -1 and
++        # are written as zeros, exactly as in the in-memory path.
++        ids = torch.from_numpy(np.where(owned, np.arange(rows), -1)).to(
++            indices.device, non_blocking=True
++        )
++        dst = torch.arange(rows, dtype=torch.int32, device=indices.device)
++        tiles = triton.cdiv(rows, 16)
++        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
++        _engram_lookup_kernel[(grid,)](
++            weight,
++            scales,
++            ids,
++            dst,
++            out,
++            0,
++            rows,
++            rows,
++            0,
++            0,
++            HEAD_START=self.head_start,
++            LOCAL_HEADS=self.part_n_hash_cols,
++            TOTAL_HEADS=self.n_hash_cols,
++            DIM=self.dim,
++            QUANT_BLOCK=self.block_size,
++            BLOCK_R=16,
++            GRID=grid,
++            SORTED=True,
++        )
++
+     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+         """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
+         bf16, gathered from all shards for this replica's tokens."""
+@@ -1379,6 +1660,7 @@
+     ) -> ParallelEngramEmbedding:
+         engram_config = get_current_vllm_config().engram_config
+         assert engram_config is not None
++        layer_id = layout.layer_ids[layer_hash_index]
+         return ParallelEngramEmbedding(
+             layout.num_embeddings[layer_hash_index],
+             layout.head_dim,
+@@ -1386,6 +1668,14 @@
+             cpu_offload=engram_config.cpu_offload,
+             dp_shared_memory=bool(engram_config.dp_shared_memory),
+             use_thp=engram_config.use_thp,
++            disk_offload=engram_config.disk_offload,
++            disk_offload_threads=engram_config.disk_offload_threads,
++            # Checkpoint names (pre-mapper): the tables live in the shards the
++            # index points at, independent of the module prefix.
++            checkpoint_names=(
++                f"layers.{layer_id}.engram.embed.weight",
++                f"layers.{layer_id}.engram.embed.scale",
++            ),
+         )
+ 
+     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
