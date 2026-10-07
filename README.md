@@ -1,4 +1,4 @@
-# vllm-engram-nvme
+# vllm-engram-nvme-4gb10
 
 **Run DeepSeek-V4.1-Flash on four DGX Spark / GB10 boxes by serving its Engram tables from NVMe instead of RAM.**
 

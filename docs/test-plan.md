@@ -1,4 +1,6 @@
-# End-to-end test plan (not yet executed)
+# End-to-end test plan
+
+Executed on 2026-10-07; the outcome is in [test-results.md](test-results.md).
 
 Prerequisites: the four nodes hold the full checkpoint (today: shards split over
 nodes 01–04 after the download; every node needs all 84 files, or at least the

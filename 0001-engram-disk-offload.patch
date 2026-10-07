@@ -537,8 +537,8 @@
      hf_weights_files: list[str],
      use_tqdm_on_load: bool,
 --- a/vllm/models/deepseek_v41/nvidia/vl_model.py	2026-10-07 19:20:55.847602791 +0200
-+++ b/vllm/models/deepseek_v41/nvidia/vl_model.py	2026-10-07 19:20:56.106122346 +0200
-@@ -317,14 +317,29 @@
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py	2026-10-07 19:40:01.707231318 +0200
+@@ -317,14 +317,38 @@
          return self.language_model.get_mtp_target_hidden_states()
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -559,11 +559,20 @@
 +        others: list[tuple[str, torch.Tensor]] = []
 +
 +        def language_model_stream() -> Iterable[tuple[str, torch.Tensor]]:
++            # The child delegates each contiguous "model." run to
++            # DeepseekV41Model.load_weights, which finalizes the fused expert
++            # weights when it returns, so that run must be one contiguous
++            # block as well: the few remaining language_model tensors (the LM
++            # head) go last, in the same group.
++            tail: list[tuple[str, torch.Tensor]] = []
 +            for name, tensor in mapped:
-+                if name.startswith("language_model."):
++                if name.startswith("language_model.model."):
 +                    yield name, tensor
++                elif name.startswith("language_model."):
++                    tail.append((name, tensor))
 +                else:
 +                    others.append((name, tensor))
++            yield from sorted(tail, key=lambda x: x[0])
 +
          loader = AutoWeightsLoader(self)
 -        loaded_params = loader.load_weights(mapped)
@@ -573,83 +582,3 @@
          # The child's load_weights already ran its post-load finalization.
          self._weights_finalized = True
          return loaded_params
---- a/vllm/models/deepseek_v41/attention.py	2026-10-07 19:20:56.366599168 +0200
-+++ b/vllm/models/deepseek_v41/attention.py	2026-10-07 19:20:56.612183262 +0200
-@@ -185,6 +185,11 @@
-     deepseek_v41 model module. The base is never instantiated directly.
-     """
- 
-+    # Sliding-window KV cache page size in tokens. Any multiple of 32 for the
-+    # FlashMLA kernels; FlashInfer's SM120 sparse-MLA decode kernels are only
-+    # instantiated for 64-token pages, so that subclass overrides it.
-+    swa_cache_block_size: ClassVar[int] = 32
-+
-     # Provided by the platform subclass.
-     backend_cls: ClassVar[type[AttentionBackend]]
-     # Backend for the SWA cache layer; None uses the default SWA backend.
-@@ -561,7 +566,7 @@
-             prefix=f"{prefix}.swa_cache",
-             cache_config=cache_config,
-             backend_cls=self.swa_backend_cls,
--            block_size=32,
-+            block_size=self.swa_cache_block_size,
-             packed_bytes_per_token=self.swa_bytes_per_token,
-             packed_page_alignment=self.kv_page_alignment,
-             bounded_replay=swa_bounded_replay,
---- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:56.886533940 +0200
-+++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:57.144891274 +0200
-@@ -115,7 +115,10 @@
- 
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [128]
-+        # The SM120 sparse-MLA decode kernels take the compressed pages at any
-+        # size (DeepSeek-V4 serves 32-row pages through them); 64 is what the
-+        # V4.1 indexer needs on SM120, see DeepseekV41IndexerBackend.
-+        return [64, 128]
- 
-     @staticmethod
-     def get_name() -> str:
-@@ -592,6 +595,9 @@
- 
-     backend_cls = DeepseekV4FlashInferMLASparseBackend
-     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
-+    # The SM120 sparse-MLA decode kernels (flashinfer 0.7.0) exist for
-+    # page_block_size=64 only; a 32-token SWA page fails at the first forward.
-+    swa_cache_block_size: ClassVar[int] = 64
-     use_fp8_ds_mla_layout: ClassVar[bool] = True
- 
-     @staticmethod
---- a/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.401591948 +0200
-+++ b/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.688192638 +0200
-@@ -86,11 +86,13 @@
-                 "aiter with VLLM_ROCM_USE_AITER=1."
-             )
-         return True
--    if use_fp4 and not current_platform.is_device_capability_family(100):
-+    if use_fp4 and not (
-+        current_platform.is_device_capability_family(100)
-+        or current_platform.is_device_capability_family(120)
-+    ):
-         raise ValueError(
--            "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
--            "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
--            "earlier architectures are not supported."
-+            "indexer_kv_dtype='mxfp4' requires Blackwell GPUs (sm_10x or "
-+            "sm_120); earlier architectures are not supported."
-         )
-     return use_fp4
- 
-@@ -297,7 +299,11 @@
- 
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [64 if current_platform.is_device_capability_family(90) else 128]
-+        # The indexer page of a compress_ratio=1 layer holds block_size rows,
-+        # and DeepGEMM's paged MQA logits take 32- or 64-row pages everywhere
-+        # but on SM100 (the sparse-indexer kernels). 64 keeps the ratio-1
-+        # layers at 64 rows and the ratio-2 layers at 32.
-+        return [128 if current_platform.is_device_capability_family(100) else 64]
- 
- 
- @dataclass(frozen=True)
