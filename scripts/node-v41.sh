@@ -45,7 +45,6 @@ start)
     --trust-remote-code --language-model-only \
     --kernel-config '{"enable_flashinfer_autotune":false}' \
     --chat-template /root/.cache/no-merge.jinja \
-    --attention-config '{"indexer_kv_dtype": "mxfp4"}' \
     --engram-config '{"disk_offload": true, "disk_offload_threads": 64}' \
     --reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41 \
     "${TAIL[@]}" >/dev/null

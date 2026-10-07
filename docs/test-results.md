@@ -24,7 +24,48 @@ So the thing this repo is about — keeping 189 GiB of Engram tables off the
 node memory — works: the model loads, the tables are served from NVMe, and
 there is room for a large KV cache.
 
-## What does not work yet: DeepSeek-V4.1 attention on sm_120
+## Second session: DeepSeek-V4.1 attention on sm_120, fixed
+
+After the first run every request returned NaN logits. Found and fixed in
+order (all in `0002-sm120-deepseek-v41-page-sizes.patch`):
+
+1. **SWA pages** — V4.1 allocates 32-token sliding-window pages; FlashInfer's
+   sm_120 sparse-MLA decode kernels exist for 64-token pages only
+   (`page_block_size=32 is unsupported`). Now 64 for the SM120 class.
+2. **Indexer / compressed pages** — DeepGEMM's sm_120 paged MQA logits take
+   64-row pages for FP8 (`arch_major == 12 and not is_fp4 and block_kv == 64`)
+   and FlashInfer's sm_120 sparse prefill takes 64-row (or 2-row) extra pages
+   (`Unsupported sparse-MLA prefill configuration ... extra_page_block_size=32`).
+   V4.1 has `compress_ratios` 2 (layers 2–19) and 1 (20–39); with one KV block
+   size one of the two always gets the wrong row count. Fixed with per-layer
+   block sizes on sm_120: 128 tokens for ratio-2 layers, 64 for ratio-1 layers
+   (`_kv_block_size_for_layer`), and `[64, 128]` as supported kernel block
+   sizes for the DSV41 sparse backend and indexer. vLLM then reports
+   `kv cache group sizes [64, ..., 128, 8, 64]` and packs them.
+3. **NaN in layer 0** (a sliding-window-only layer, no Engram, no indexer).
+   Dumped the kernel inputs from the running server and replayed them on one
+   GPU: the kernel output matched a torch reference (max err 0.011) — except
+   that in the server every row whose window did not fill a whole 64-row
+   tile had NaN in dims 233 and 238 of every head. Replaying with garbage in
+   block 0 reproduced it: the sm_120 kernel reads block 0 for every masked
+   (-1) index and multiplies by a zero probability, so NaN bytes there poison
+   the row. In the server block 0 held the dummy KV of the warmup/capture
+   runs (slot 0), whose near-zero activations had quantized to fp8 NaN bytes
+   with all-zero scales. Fix: zero the null block of every KV cache after
+   warmup and CUDA graph capture (`gpu_worker.py`), and at bind time.
+
+Result: "The capital of France is" → " Paris."; a 12,242-token prompt with a
+hidden password is answered correctly from reasoning; reasoning output is
+coherent. Single-stream decode ~24 tok/s, 12k-token prefill ~10 s.
+
+## Open
+
+DSpark, tool-call / `/v1/messages` parsing, concurrency, long-run stability
+and real measurements are next.
+
+## First session (2026-10-07, before the fixes above)
+
+### What did not work: DeepSeek-V4.1 attention on sm_120
 
 Every request returns NaN logits (the API reports `Out of range float
 values: nan`; a `/v1/chat/completions` call produces byte garbage). With
@@ -69,7 +110,7 @@ geometries) or sm_120 kernel instantiations for 32- and 128-row pages in
 FlashInfer and DeepGEMM, plus the layer-0 NaN fixed. That is attention-stack
 work independent of this repo; the Engram-from-NVMe part is ready for it.
 
-## Not run
+### Not run (then)
 
 Chat/`/v1/messages`/tool-call checks, DSpark, latency measurements: blocked by
 the above. The production DeepSeek-V4-Flash service was restored afterwards.

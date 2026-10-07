@@ -1,6 +1,28 @@
 --- a/vllm/models/deepseek_v41/attention.py	2026-10-07 19:20:56.366599168 +0200
-+++ b/vllm/models/deepseek_v41/attention.py	2026-10-07 19:20:56.612183262 +0200
-@@ -185,6 +185,11 @@
++++ b/vllm/models/deepseek_v41/attention.py	2026-10-07 21:07:21.410539793 +0200
+@@ -129,6 +129,21 @@
+     return current_platform.is_device_capability_family(100)
+ 
+ 
++def _kv_block_size_for_layer(compress_ratio: int, default_block_size: int) -> int:
++    """KV block size (tokens) of a compressed-KV source layer.
++
++    On sm_120 every kernel that reads a compressed or indexer page (FlashInfer
++    sparse-MLA decode/prefill, DeepGEMM paged MQA logits) is instantiated for
++    64-row pages only, while V4.1 mixes compress ratios 2 and 1. One block size
++    cannot give both 64 rows, so each ratio gets its own: 128 tokens for the
++    ratio-2 layers, 64 for the ratio-1 layers. The groups then pack with
++    different block sizes, as the sliding-window cache already does.
++    """
++    if current_platform.is_device_capability_family(120) and compress_ratio in (1, 2):
++        return 64 * compress_ratio
++    return default_block_size
++
++
+ def _resolve_dsv4_kv_cache_dtype(
+     use_fp8_ds_mla_layout: bool,
+     kv_cache_dtype: CacheDType,
+@@ -185,6 +200,11 @@
      deepseek_v41 model module. The base is never instantiated directly.
      """
  
@@ -12,7 +34,7 @@
      # Provided by the platform subclass.
      backend_cls: ClassVar[type[AttentionBackend]]
      # Backend for the SWA cache layer; None uses the default SWA backend.
-@@ -561,7 +566,7 @@
+@@ -561,7 +581,7 @@
              prefix=f"{prefix}.swa_cache",
              cache_config=cache_config,
              backend_cls=self.swa_backend_cls,
@@ -21,6 +43,52 @@
              packed_bytes_per_token=self.swa_bytes_per_token,
              packed_page_alignment=self.kv_page_alignment,
              bounded_replay=swa_bounded_replay,
+@@ -1103,6 +1123,11 @@
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+         # [B, H=1, N, C] -> [B, N, C]
+         self.kv_cache = kv_cache.squeeze(1)
++        # Block 0 is the null block: never written, but the sm_120 sparse-MLA
++        # kernels read it for every masked (-1) index and multiply by a zero
++        # probability, so any NaN byte left in it poisons the output. Zero it.
++        if kv_cache.numel() and kv_cache.shape[0] > 0:
++            kv_cache[0].zero_()
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return self.backend_cls
+@@ -1119,7 +1144,9 @@
+         # use natural element-size pages.
+         uses_fp8_ds_mla_layout = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+         return MLAAttentionSpec(
+-            block_size=vllm_config.cache_config.block_size,
++            block_size=_kv_block_size_for_layer(
++                self.compress_ratio, vllm_config.cache_config.block_size
++            ),
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+@@ -1174,6 +1201,11 @@
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+         # [B, H=1, N, C] -> [B, N, C]
+         self.kv_cache = kv_cache.squeeze(1)
++        # Block 0 is the null block: never written, but the sm_120 sparse-MLA
++        # kernels read it for every masked (-1) index and multiply by a zero
++        # probability, so any NaN byte left in it poisons the output. Zero it.
++        if kv_cache.numel() and kv_cache.shape[0] > 0:
++            kv_cache[0].zero_()
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+         # head_dim already carries the fp8 scale padding
+@@ -1189,7 +1221,9 @@
+             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
+         )
+         return MLAAttentionSpec(
+-            block_size=self.cache_config.block_size,
++            block_size=_kv_block_size_for_layer(
++                self.compress_ratio, self.cache_config.block_size
++            ),
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=self.dtype,
 --- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:56.886533940 +0200
 +++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:57.144891274 +0200
 @@ -115,7 +115,10 @@
@@ -46,7 +114,7 @@
  
      @staticmethod
 --- a/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.401591948 +0200
-+++ b/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.688192638 +0200
++++ b/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 20:21:27.889746108 +0200
 @@ -86,11 +86,13 @@
                  "aiter with VLLM_ROCM_USE_AITER=1."
              )
@@ -65,7 +133,7 @@
          )
      return use_fp4
  
-@@ -297,7 +299,11 @@
+@@ -297,7 +299,17 @@
  
      @staticmethod
      def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
@@ -74,7 +142,45 @@
 +        # and DeepGEMM's paged MQA logits take 32- or 64-row pages everywhere
 +        # but on SM100 (the sparse-indexer kernels). 64 keeps the ratio-1
 +        # layers at 64 rows and the ratio-2 layers at 32.
-+        return [128 if current_platform.is_device_capability_family(100) else 64]
++        if current_platform.is_device_capability_family(100):
++            return [128]
++        if current_platform.is_device_capability_family(120):
++            # Per-layer block sizes (see _kv_block_size_for_layer): 128 for
++            # the ratio-2 layers, 64 for the ratio-1 layers, 64 rows each.
++            return [64, 128]
++        return [64]
  
  
  @dataclass(frozen=True)
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py	2026-10-07 21:07:21.293828254 +0200
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py	2026-10-07 21:07:21.410689889 +0200
+@@ -111,6 +111,11 @@
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+         # [B, H=1, N, C] -> [B, N, C]
+         self.kv_cache = kv_cache.squeeze(1)
++        # Block 0 is the null block: never written, but the sm_120 sparse-MLA
++        # kernels read it for every masked (-1) index and multiply by a zero
++        # probability, so any NaN byte left in it poisons the output. Zero it.
++        if kv_cache.numel() and kv_cache.shape[0] > 0:
++            kv_cache[0].zero_()
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+         # fp8_ds_mla's UE8M0 paged layout rounds its page up to the decode
+--- a/vllm/v1/worker/gpu_worker.py	2026-10-07 21:31:40.650348941 +0200
++++ b/vllm/v1/worker/gpu_worker.py	2026-10-07 21:31:40.775833553 +0200
+@@ -911,6 +911,15 @@
+             with self._get_cudagraph_capture_context():
+                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+ 
++        # Warmup and capture runs store their dummy KV into slot 0 of the null
++        # block, and the rows they leave there can hold NaN bytes (near-zero
++        # dummy activations quantized with an underflowing scale). Masked
++        # (-1) sparse indices read that block on sm_120 and multiply by a zero
++        # probability, which turns NaN; keep the null block zero.
++        for cache in getattr(self.model_runner, "kv_caches", []):
++            if isinstance(cache, torch.Tensor) and cache.ndim >= 1 and cache.shape[0] > 0:
++                cache[0].zero_()
++
+         # Compare actual vs estimated CUDA graph memory (if we did profiling)
+         if (
+             hasattr(self, "cudagraph_memory_estimate")
