@@ -2,15 +2,15 @@
 
 **Run DeepSeek-V4.1-Flash on four DGX Spark / GB10 boxes by serving its Engram tables from NVMe instead of RAM.**
 
-> Status: **the Engram-from-NVMe part works end-to-end; DeepSeek-V4.1 itself
-> does not run on sm_120 (GB10 / DGX Spark) with this vLLM nightly yet.**
-> On the four-node cluster the model loads in 74.9 GiB per node (the stock
-> nightly is OOM-killed), both Engram tables are served from the NVMe, the
-> memory profiler and CUDA graph captures pass and vLLM reports a 6.3M-token
-> KV cache. Requests then return NaN logits, traced to the V4.1 attention
-> stack on sm_120 (sliding-window / indexer / sparse-prefill page sizes that
-> the sm_120 kernels do not support), not to the Engram path. Details and
-> the exact errors are in [docs/test-results.md](docs/test-results.md).
+> Status: **working on the 4x GB10 cluster (2026-10-07).** DeepSeek-V4.1-Flash
+> loads in 74.9 GiB per node with both Engram tables served from NVMe, vLLM
+> reports a 4.0M-token KV cache, and the model answers correctly (short
+> prompts, a 12k-token needle-in-a-haystack, reasoning). Getting there also
+> needed `0002-sm120-deepseek-v41-page-sizes.patch`: V4.1 was not runnable
+> on sm_120 (GB10 / DGX Spark) with this vLLM nightly at all, for reasons
+> unrelated to Engram — see [docs/test-results.md](docs/test-results.md).
+> Not yet done: DSpark, tool calls through the parsers, throughput numbers,
+> long-running stability.
 
 ## The problem
 
@@ -82,7 +82,7 @@ What that means per node (two Engram layers, this rank's heads):
 
 ```
 0001-engram-disk-offload.patch   # against vLLM 0cbac6cd1 (nightly 0.30.1rc1.dev558)
-0002-sm120-deepseek-v41-page-sizes.patch  # experimental sm_120 workarounds, see below
+0002-sm120-deepseek-v41-page-sizes.patch  # DeepSeek-V4.1 on sm_120 (GB10 / DGX Spark), see below
 Dockerfile                       # vllm/vllm-openai nightly + the patches
 scripts/
   build-image.sh                 # build the patched image on a node
@@ -124,12 +124,26 @@ docs/
   streams the `language_model.model.` group, with the LM head last in the
   same group, so each shard is released as soon as it is consumed.
 
-`0002-sm120-deepseek-v41-page-sizes.patch` — **experimental**, sm_120 only:
-64-token sliding-window pages for the SM120 FlashInfer attention class,
-64-token KV blocks for the V4.1 indexer, and `indexer_kv_dtype=mxfp4` allowed
-on sm_120. Each hunk removes one startup error on GB10; together they are not
-enough (see the status above). `Dockerfile` applies it unless built with
-`--build-arg SM120=0`.
+`0002-sm120-deepseek-v41-page-sizes.patch` — makes DeepSeek-V4.1 run on
+sm_120 at all (five files, nothing to do with Engram; needed on GB10 / DGX
+Spark, harmless elsewhere):
+
+* 64-token sliding-window pages for the SM120 FlashInfer attention class
+  (its sparse-MLA decode kernels only exist for 64-token pages; V4.1 used 32).
+* Per-layer KV block sizes on sm_120: 128 tokens for the compress-ratio-2
+  layers, 64 for the ratio-1 layers, so every compressed and indexer page
+  holds 64 rows — the only page size FlashInfer's sm_120 sparse prefill
+  (`extra_page_block_size`) and DeepGEMM's sm_120 FP8 paged MQA logits
+  accept. vLLM's hybrid KV cache manager packs the two groups with different
+  block sizes, as it already does for the sliding-window cache.
+* The null block (block 0) is zeroed after warmup and CUDA graph capture.
+  Warmup runs store their dummy KV into slot 0, and near-zero dummy
+  activations quantize to NaN bytes there; the sm_120 sparse-MLA kernels read
+  block 0 for every masked (-1) index and multiply by a zero probability,
+  which turned every partially filled attention row into NaN. Finding this
+  took most of the day; the kernel-level fix belongs in FlashInfer.
+* `indexer_kv_dtype=mxfp4` is allowed on sm_120 (DeepGEMM 2.8 ships the
+  kernels); not needed with the per-layer block sizes, FP8 is the default.
 
 Scope: TP sharding only (`engram_dp_size == 1`). The multi-DP table
 sharing/sharding paths raise a clear error with `disk_offload` on.
@@ -169,27 +183,23 @@ Requirements and caveats:
 | | V4-Flash (production) | V4.1-Flash, Engram on NVMe |
 |---|---:|---:|
 | Weights | 42.7 GiB | **74.9 GiB** (vLLM "Model loading took") |
-| KV cache (`--gpu-memory-utilization 0.8`) | 47 GiB | 6.28M tokens, 47.9 x 131k requests |
+| KV cache (`--gpu-memory-utilization 0.8`) | 47 GiB | 3.98M tokens, 30 x 131k requests |
 | Page cache for Engram | – | whatever is left (~20 GiB) |
 
 ## Roadmap
 
-1. **Make DeepSeek-V4.1 run on sm_120 at all.** Three kernel page-size
-   constraints collide on GB10 (sliding-window pages, indexer pages, sparse
-   prefill "extra" pages; the ratio-1 and ratio-2 layers want different
-   geometries under vLLM's single KV block size) and layer 0's attention
-   returns NaN on real input — see [docs/test-results.md](docs/test-results.md).
-   This is attention-stack work in vLLM / FlashInfer / DeepGEMM, not in the
-   Engram path; help from people who know those kernels is very welcome.
-2. End-to-end quality and latency once (1) is solved: chat, reasoning and
-   tool-call parsing, decode and prefill timings against the in-memory numbers
-   NVIDIA publishes for GB300 and against V4-Flash on the same cluster.
+1. Measure: decode and prefill against V4-Flash on the same cluster and the
+   in-memory numbers NVIDIA publishes for GB300; page-cache hit rates on
+   real coding traffic. First numbers: ~24 tok/s single-stream decode,
+   a 12k-token prompt prefills in ~10 s.
+2. DSpark speculative decoding (`--speculative-config` with `method: dspark`),
+   tool-call and `/v1/messages` parsing, multi-request stability.
 3. Prefetch: the hash ids are known before the decoder runs, so the gather for
    step *t+1* can start while step *t* computes (and for DSpark drafts).
 4. Engram DP sharding support (`engram_dp_size > 1`).
-5. Upstream discussion: whether this belongs in vLLM as `cpu_offload="disk"`,
-   and the `vl_model.py` streaming load as a fix on its own (it is what lets
-   the 302 GiB backbone load on 4 x 121.6 GiB at all).
+5. Upstream: the `vl_model.py` streaming load and the null-block fix are bugs
+   on their own; the per-layer block sizes and `cpu_offload="disk"` are
+   proposals.
 
 ## Credits
 
