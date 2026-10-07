@@ -2,12 +2,15 @@
 
 **Run DeepSeek-V4.1-Flash on four DGX Spark / GB10 boxes by serving its Engram tables from NVMe instead of RAM.**
 
-> Status: **draft, partially validated.** The storage layer (memory-mapping the
-> checkpoint, per-rank row gather, thread pool) is tested bit-exact against the
-> real `nvidia/DeepSeek-V4.1-Flash-NVFP4` checkpoint. The vLLM integration
-> (lookup kernel on gathered rows, side-stream prefetch, CUDA-graph behaviour)
-> has **not** been run end-to-end yet, because the cluster this was written
-> for is busy serving DeepSeek-V4-Flash. See [Roadmap](#roadmap).
+> Status: **the Engram-from-NVMe part works end-to-end; DeepSeek-V4.1 itself
+> does not run on sm_120 (GB10 / DGX Spark) with this vLLM nightly yet.**
+> On the four-node cluster the model loads in 74.9 GiB per node (the stock
+> nightly is OOM-killed), both Engram tables are served from the NVMe, the
+> memory profiler and CUDA graph captures pass and vLLM reports a 6.3M-token
+> KV cache. Requests then return NaN logits, traced to the V4.1 attention
+> stack on sm_120 (sliding-window / indexer / sparse-prefill page sizes that
+> the sm_120 kernels do not support), not to the Engram path. Details and
+> the exact errors are in [docs/test-results.md](docs/test-results.md).
 
 ## The problem
 
@@ -79,19 +82,22 @@ What that means per node (two Engram layers, this rank's heads):
 
 ```
 0001-engram-disk-offload.patch   # against vLLM 0cbac6cd1 (nightly 0.30.1rc1.dev558)
-Dockerfile                       # vllm/vllm-openai nightly + the patch
+0002-sm120-deepseek-v41-page-sizes.patch  # experimental sm_120 workarounds, see below
+Dockerfile                       # vllm/vllm-openai nightly + the patches
 scripts/
   build-image.sh                 # build the patched image on a node
   engram_disk_bench.py           # the NVMe gather benchmark above (no vLLM, no GPU)
   verify_disk_mapping.py         # bit-exact check of the storage layer vs. pread()
   node-v41.sh                    # per-node launcher used on the 4x GB10 ring cluster
+  dev/                           # the scripts that generated the patch hunks
 docs/
-  test-plan.md                   # the end-to-end validation still to be done
+  test-plan.md                   # the end-to-end validation plan
+  test-results.md                # what happened on the 4x GB10 cluster (2026-10-07)
 ```
 
-### The patch
+### The patches
 
-Two files in vLLM:
+`0001-engram-disk-offload.patch` — the actual feature, four files in vLLM:
 
 * `vllm/config/engram.py` — `EngramConfig` gains `disk_offload: bool = False`
   and `disk_offload_threads: int = 64`, validated against `dp_shared_memory`
@@ -100,7 +106,30 @@ Two files in vLLM:
   (safetensors header parsing, per-rank mmap, pooled gather into pinned
   buffers, no-op weight loader) and a `_lookup_from_disk` path in
   `ParallelEngramEmbedding` that feeds the gathered rows to the unchanged
-  `_engram_lookup_kernel` in its sorted mode with identity destinations.
+  `_engram_lookup_kernel` in its sorted mode with identity destinations. A
+  plain (non-breakable) CUDA graph capture — vLLM's memory-sizing capture —
+  skips the host gather; the breakable capture used for replay runs it
+  eagerly every step.
+* `vllm/model_executor/model_loader/weight_utils.py` — the safetensors
+  iterators hand the weight loader an empty placeholder for the registered
+  Engram tensors instead of reading them, and with
+  `VLLM_SAFETENSORS_CLONE_ON_LOAD=1` clone every other tensor off the file
+  mapping before a loader touches it (a device copy straight out of the
+  `MAP_PRIVATE` mapping pins its pages into anonymous memory that is only
+  freed when the mapping closes).
+* `vllm/models/deepseek_v41/nvidia/vl_model.py` — the V4.1 wrapper sorted a
+  *materialized* list of every mapped weight before loading, which keeps all
+  49 shard mappings (and the pinned pages above) alive for the whole load and
+  does not fit on a 121.6 GiB node even with the Engram tables gone. It now
+  streams the `language_model.model.` group, with the LM head last in the
+  same group, so each shard is released as soon as it is consumed.
+
+`0002-sm120-deepseek-v41-page-sizes.patch` — **experimental**, sm_120 only:
+64-token sliding-window pages for the SM120 FlashInfer attention class,
+64-token KV blocks for the V4.1 indexer, and `indexer_kv_dtype=mxfp4` allowed
+on sm_120. Each hunk removes one startup error on GB10; together they are not
+enough (see the status above). `Dockerfile` applies it unless built with
+`--build-arg SM120=0`.
 
 Scope: TP sharding only (`engram_dp_size == 1`). The multi-DP table
 sharing/sharding paths raise a clear error with `disk_offload` on.
@@ -111,12 +140,14 @@ sharing/sharding paths raise a clear error with `disk_offload` on.
 # build the image on each node (base image must be present locally)
 scripts/build-image.sh            # -> vllm-engram-nvme:latest
 
-vllm serve /models/DeepSeek-V4.1-Flash-NVFP4 \
+VLLM_SAFETENSORS_CLONE_ON_LOAD=1 vllm serve /models/DeepSeek-V4.1-Flash-NVFP4 \
   --tensor-parallel-size 4 --nnodes 4 --node-rank 0 ... \
   --language-model-only \
   --engram-config '{"disk_offload": true, "disk_offload_threads": 64}' \
   ...
 ```
+
+`scripts/node-v41.sh` is the complete per-node command used on the cluster.
 
 Requirements and caveats:
 
@@ -133,32 +164,32 @@ Requirements and caveats:
 * First-token latency on a cold page cache is dominated by random reads; the
   numbers above are the realistic cost.
 
-## Memory budget on a GB10 node (121.6 GiB)
+## Memory budget on a GB10 node (121.6 GiB), measured
 
-| | Today (V4-Flash) | V4.1-Flash, Engram on NVMe |
+| | V4-Flash (production) | V4.1-Flash, Engram on NVMe |
 |---|---:|---:|
-| Weights | 42.7 GiB | ~76 GiB |
-| Peak activation + CUDA graphs | ~7 GiB | ~7 GiB (to be measured) |
-| KV cache (`--gpu-memory-utilization 0.8`) | 47 GiB | ~14 GiB |
-| OS + page cache for Engram | ~24 GiB | ~24 GiB |
-
-14 GiB of KV cache is enough for a handful of 131k–262k requests; the exact
-number depends on V4.1's KV layout (FP4 main KV, CSA2), which vLLM reports at
-startup.
+| Weights | 42.7 GiB | **74.9 GiB** (vLLM "Model loading took") |
+| KV cache (`--gpu-memory-utilization 0.8`) | 47 GiB | 6.28M tokens, 47.9 x 131k requests |
+| Page cache for Engram | – | whatever is left (~20 GiB) |
 
 ## Roadmap
 
-1. End-to-end smoke test on the 4-node cluster: load, `/v1/models`, a chat
-   completion, reasoning + tool-call parsing. Watch for: the eager-break
-   lookup path under CUDA graph capture (the gather is a host sync), the
-   side-stream copy/kernel ordering, and the memory profiler's dummy-weight
-   run with no real table in memory.
-2. Measure decode and prefill against the in-memory numbers NVIDIA publishes
-   for GB300, and against V4-Flash on the same cluster.
+1. **Make DeepSeek-V4.1 run on sm_120 at all.** Three kernel page-size
+   constraints collide on GB10 (sliding-window pages, indexer pages, sparse
+   prefill "extra" pages; the ratio-1 and ratio-2 layers want different
+   geometries under vLLM's single KV block size) and layer 0's attention
+   returns NaN on real input — see [docs/test-results.md](docs/test-results.md).
+   This is attention-stack work in vLLM / FlashInfer / DeepGEMM, not in the
+   Engram path; help from people who know those kernels is very welcome.
+2. End-to-end quality and latency once (1) is solved: chat, reasoning and
+   tool-call parsing, decode and prefill timings against the in-memory numbers
+   NVIDIA publishes for GB300 and against V4-Flash on the same cluster.
 3. Prefetch: the hash ids are known before the decoder runs, so the gather for
    step *t+1* can start while step *t* computes (and for DSpark drafts).
 4. Engram DP sharding support (`engram_dp_size > 1`).
-5. Upstream discussion: whether this belongs in vLLM as `cpu_offload="disk"`.
+5. Upstream discussion: whether this belongs in vLLM as `cpu_offload="disk"`,
+   and the `vl_model.py` streaming load as a fix on its own (it is what lets
+   the 302 GiB backbone load on 4 x 121.6 GiB at all).
 
 ## Credits
 
@@ -172,5 +203,5 @@ startup.
 
 ## License
 
-Apache-2.0, same as vLLM. The patch is a derivative of vLLM's
-`vllm/models/deepseek_v41/common/engram.py` and `vllm/config/engram.py`.
+Apache-2.0, same as vLLM. The patches are derivatives of the vLLM files they
+modify.
