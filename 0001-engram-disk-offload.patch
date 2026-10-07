@@ -1,5 +1,5 @@
---- a/vllm/config/engram.py	2026-10-07 16:39:18.722263309 +0200
-+++ b/vllm/config/engram.py	2026-10-07 16:39:18.741477037 +0200
+--- a/vllm/config/engram.py	2026-10-07 19:20:54.200136242 +0200
++++ b/vllm/config/engram.py	2026-10-07 19:20:54.468004193 +0200
 @@ -55,6 +55,22 @@
      effort, falls back to ordinary pinned pages). Prefaulting the tables at
      startup takes longer. Requires cpu_offload without dp_shared_memory."""
@@ -47,8 +47,8 @@
                  and parallel_config.data_parallel_size > 1
                  and not parallel_config.enable_elastic_ep
              )
---- a/vllm/models/deepseek_v41/common/engram.py	2026-10-07 16:39:18.722051715 +0200
-+++ b/vllm/models/deepseek_v41/common/engram.py	2026-10-07 16:41:33.606031796 +0200
+--- a/vllm/models/deepseek_v41/common/engram.py	2026-10-07 19:20:54.738610540 +0200
++++ b/vllm/models/deepseek_v41/common/engram.py	2026-10-07 19:20:57.822848068 +0200
 @@ -35,10 +35,13 @@
  """
  
@@ -63,7 +63,15 @@
  from contextlib import ExitStack
  
  import numpy as np
-@@ -911,6 +914,192 @@
+@@ -64,6 +67,7 @@
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.model_loader.weight_utils import register_placeholder_weight
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+@@ -911,6 +915,211 @@
      return tensor
  
  
@@ -133,6 +141,10 @@
 +        self.vocab_start, self.num_rows = vocab_start, num_rows
 +        self.dim, self.scale_dim = dim, dim // block_size
 +        self.threads = threads
++        # Keep the safetensors iterator from ever reading the tables: it hands
++        # the loader an empty placeholder for these names instead.
++        register_placeholder_weight(weight_name)
++        register_placeholder_weight(scale_name)
 +        self._mappings: list[mmap.mmap] = []
 +        self._paths: list[str] = []
 +        self.weight_np = self._map_rows(model_path, weight_name, dim)
@@ -194,10 +206,16 @@
 +        )
 +
 +    def load_weight(self, param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
-+        """Nothing to copy: only check that the checkpoint agrees with the mapping."""
++        """Nothing to copy: only check that the checkpoint agrees with the mapping.
++
++        `loaded_weight` is normally the empty placeholder the iterator yields
++        for a registered name; a real (lazily mapped) tensor is accepted too.
++        """
 +        expected = (self.num_rows, param.shape[1])
 +        if tuple(param.shape) != expected:
 +            raise RuntimeError(f"disk Engram param {tuple(param.shape)} != {expected}")
++        if loaded_weight.shape[0] == 0:
++            return
 +        if loaded_weight.shape[0] < self.vocab_start + self.num_rows:
 +            raise RuntimeError(
 +                f"checkpoint tensor has {loaded_weight.shape[0]} rows, mapping "
@@ -219,6 +237,15 @@
 +            )
 +        assert self._weight_buf is not None and self._scales_buf is not None
 +        return self._weight_buf[:rows], self._scales_buf[:rows]
++
++    def device_buffers(
++        self, rows: int, device: torch.device
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Device tensors of the shape `gather` returns, contents unspecified."""
++        return (
++            torch.empty((rows, self.dim), dtype=torch.float8_e4m3fn, device=device),
++            torch.empty((rows, self.scale_dim), dtype=torch.uint8, device=device),
++        )
 +
 +    def gather(
 +        self, local_rows: np.ndarray, device: torch.device
@@ -256,7 +283,7 @@
  class ParallelEngramEmbedding(nn.Module):
      """Hash heads with FP8 rows and per-block E8M0 scales.
  
-@@ -931,6 +1120,9 @@
+@@ -931,6 +1140,9 @@
          cpu_offload: bool = False,
          dp_shared_memory: bool = False,
          use_thp: bool = False,
@@ -266,7 +293,7 @@
      ) -> None:
          super().__init__()
          assert head_sizes and all(size > 0 for size in head_sizes)
-@@ -938,6 +1130,19 @@
+@@ -938,6 +1150,19 @@
          self.cpu_offload = cpu_offload
          self.dp_shared_memory = dp_shared_memory
          self.use_thp = use_thp
@@ -286,7 +313,7 @@
          self.dp_size = get_engram_dp_size()
          if dp_shared_memory:
              if not cpu_offload:
-@@ -985,7 +1190,17 @@
+@@ -985,7 +1210,17 @@
                      "engram_vocab_start": self.vocab_start_idx,
                  },
              )
@@ -305,7 +332,7 @@
              # Constant dummy values avoid randomizing huge CPU lookup tables.
              set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
              # The ue8m0 encoding of scale 1.0 is exponent byte 127.
-@@ -1005,6 +1220,22 @@
+@@ -1005,6 +1240,22 @@
          return self.tp_size * self.dp_size, engram_head_shard_rank()
  
      def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -328,7 +355,7 @@
          if self.dp_shared_memory:
              group = get_engram_dp_group()
              assert group is not None
-@@ -1089,6 +1320,9 @@
+@@ -1089,6 +1340,9 @@
          rows = indices.shape[0] * self.part_n_hash_cols
          if not rows:
              return
@@ -338,7 +365,7 @@
          weight, scales = self._storage()
          ids_stride_t, ids_stride_h = indices.stride()
          sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
-@@ -1133,6 +1367,53 @@
+@@ -1133,6 +1387,61 @@
              SORTED=sort,
          )
  
@@ -351,20 +378,28 @@
 +        the device-to-host copy of the hash ids is an ordinary sync.
 +        """
 +        assert self._disk is not None
-+        head_end = self.head_start + self.part_n_hash_cols
-+        local = indices[:, self.head_start : head_end] - self.vocab_start_idx
-+        if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
-+            local = nn.functional.pad(local, (0, pad), value=-1)
-+        local_np = local.reshape(-1).to("cpu", dtype=torch.int64).numpy()
-+        owned = (local_np >= 0) & (local_np < self.part_num_embeddings)
-+        weight, scales = self._disk.gather(local_np, indices.device)
-+        # The gathered rows form a dense table of `rows` entries in output
-+        # order, so the sorted-lookup path is run against it with identity
-+        # destinations; masked rows (DEAD_ID, other ranks' heads) read as -1 and
-+        # are written as zeros, exactly as in the in-memory path.
-+        ids = torch.from_numpy(np.where(owned, np.arange(rows), -1)).to(
-+            indices.device, non_blocking=True
-+        )
++        if torch.cuda.is_current_stream_capturing():
++            # A plain (non-breakable) capture, e.g. the one that sizes CUDA
++            # graph memory at startup, cannot carry host work or syncs. Stage
++            # nothing and mask every row; the breakable capture used for
++            # replay runs this lookup eagerly on every step.
++            weight, scales = self._disk.device_buffers(rows, indices.device)
++            ids = torch.full((rows,), -1, dtype=torch.int64, device=indices.device)
++        else:
++            head_end = self.head_start + self.part_n_hash_cols
++            local = indices[:, self.head_start : head_end] - self.vocab_start_idx
++            if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
++                local = nn.functional.pad(local, (0, pad), value=-1)
++            local_np = local.reshape(-1).to("cpu", dtype=torch.int64).numpy()
++            owned = (local_np >= 0) & (local_np < self.part_num_embeddings)
++            weight, scales = self._disk.gather(local_np, indices.device)
++            # The gathered rows form a dense table of `rows` entries in output
++            # order, so the sorted-lookup path is run against it with identity
++            # destinations; masked rows (DEAD_ID, other ranks' heads) read as
++            # -1 and are written as zeros, exactly as in the in-memory path.
++            ids = torch.from_numpy(np.where(owned, np.arange(rows), -1)).to(
++                indices.device, non_blocking=True
++            )
 +        dst = torch.arange(rows, dtype=torch.int32, device=indices.device)
 +        tiles = triton.cdiv(rows, 16)
 +        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
@@ -392,7 +427,7 @@
      def forward(self, indices: torch.Tensor) -> torch.Tensor:
          """indices: [num_tokens, n_hash_cols] -> [num_tokens, n_hash_cols, dim]
          bf16, gathered from all shards for this replica's tokens."""
-@@ -1379,6 +1660,7 @@
+@@ -1379,6 +1688,7 @@
      ) -> ParallelEngramEmbedding:
          engram_config = get_current_vllm_config().engram_config
          assert engram_config is not None
@@ -400,7 +435,7 @@
          return ParallelEngramEmbedding(
              layout.num_embeddings[layer_hash_index],
              layout.head_dim,
-@@ -1386,6 +1668,14 @@
+@@ -1386,6 +1696,14 @@
              cpu_offload=engram_config.cpu_offload,
              dp_shared_memory=bool(engram_config.dp_shared_memory),
              use_thp=engram_config.use_thp,
@@ -415,3 +450,206 @@
          )
  
      def _init_staging(self, max_tokens: int, head_dim: int) -> None:
+--- a/vllm/model_executor/model_loader/weight_utils.py	2026-10-07 19:20:55.294606654 +0200
++++ b/vllm/model_executor/model_loader/weight_utils.py	2026-10-07 19:20:55.569604733 +0200
+@@ -1123,7 +1123,18 @@
+         disable=not enable_tqdm(use_tqdm_on_load),
+         bar_format=_BAR_FORMAT,
+     ):
+-        if safetensors_load_strategy == "eager":
++        if safetensors_load_strategy == "eager" and _has_placeholder_weights(st_file):
++            # The file holds tensors a module maps from storage itself: never
++            # read those into memory; the rest of the file is read lazily.
++            with safe_open(st_file, framework="pt") as f:
++                for name in f.keys():  # noqa: SIM118
++                    if should_skip_weight(name, local_expert_ids):
++                        continue
++                    if name in _PLACEHOLDER_WEIGHTS:
++                        yield name, _placeholder_weight(f, name)
++                        continue
++                    yield name, f.get_tensor(name)
++        elif safetensors_load_strategy == "eager":
+             with open(st_file, "rb") as f:
+                 state_dict = load(f.read())
+             for name, param in state_dict.items():
+@@ -1164,10 +1175,63 @@
+                 for name in f.keys():  # noqa: SIM118
+                     if should_skip_weight(name, local_expert_ids):
+                         continue
++                    if name in _PLACEHOLDER_WEIGHTS:
++                        yield name, _placeholder_weight(f, name)
++                        continue
+                     param = f.get_tensor(name)
++                    if _CLONE_ON_LOAD:
++                        # Hand the loader a private copy: a device copy straight
++                        # out of the MAP_PRIVATE file mapping pins its pages and
++                        # turns them into anonymous memory that is only released
++                        # when the mapping closes (see README, "copy on load").
++                        param = param.clone()
+                     yield name, param
+ 
+ 
++# Checkpoint tensors that a module maps from storage itself (see
++# DiskEngramStorage): the iterators above hand the weight loader an empty
++# placeholder of the right dtype and trailing shape instead of reading them,
++# which keeps a 100 GiB table out of host memory.
++_PLACEHOLDER_WEIGHTS: set[str] = set()
++
++_SAFETENSORS_DTYPES = {
++    "F8_E4M3": torch.float8_e4m3fn,
++    "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
++    "U8": torch.uint8,
++    "I8": torch.int8,
++    "BF16": torch.bfloat16,
++    "F16": torch.float16,
++    "F32": torch.float32,
++    "I32": torch.int32,
++    "I64": torch.int64,
++}
++
++
++# With VLLM_SAFETENSORS_CLONE_ON_LOAD=1 every tensor is cloned off the file
++# mapping before it reaches a weight loader (see the comment at the use site).
++_CLONE_ON_LOAD = os.environ.get("VLLM_SAFETENSORS_CLONE_ON_LOAD", "0") == "1"
++
++
++def register_placeholder_weight(name: str) -> None:
++    """Yield an empty placeholder for checkpoint tensor `name` instead of
++    reading it; the owning module's weight loader must accept it."""
++    _PLACEHOLDER_WEIGHTS.add(name)
++
++
++def _placeholder_weight(f, name: str) -> torch.Tensor:
++    view = f.get_slice(name)
++    shape = view.get_shape()
++    dtype = _SAFETENSORS_DTYPES.get(view.get_dtype(), torch.uint8)
++    return torch.empty((0, *shape[1:]), dtype=dtype)
++
++
++def _has_placeholder_weights(st_file: str) -> bool:
++    if not _PLACEHOLDER_WEIGHTS:
++        return False
++    with safe_open(st_file, framework="pt") as f:
++        return any(name in _PLACEHOLDER_WEIGHTS for name in f.keys())  # noqa: SIM118
++
++
+ def multi_thread_safetensors_weights_iterator(
+     hf_weights_files: list[str],
+     use_tqdm_on_load: bool,
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py	2026-10-07 19:20:55.847602791 +0200
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py	2026-10-07 19:20:56.106122346 +0200
+@@ -317,14 +317,29 @@
+         return self.language_model.get_mtp_target_hidden_states()
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        # Map HF names into this wrapper's namespace up front and sort, so
+-        # the "language_model." group reaches the child loader as one
++        # The "language_model." group must reach the child loader as one
+         # contiguous block (AutoWeightsLoader delegates per contiguous group,
+         # and the child's load_weights finalizes fused expert weights, which
+-        # must not run on a partially loaded model).
+-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
++        # must not run on a partially loaded model). Stream that group instead
++        # of materializing the whole checkpoint: a sorted list keeps every
++        # safetensors mapping alive until the end of the load, and the pages a
++        # device copy pins out of a private file mapping are only released when
++        # the mapping closes, which does not fit on a 128 GB unified-memory
++        # node. Only the (small) remaining tensors are buffered.
++        mapped = self.hf_to_vllm_mapper.apply(weights)
++        others: list[tuple[str, torch.Tensor]] = []
++
++        def language_model_stream() -> Iterable[tuple[str, torch.Tensor]]:
++            for name, tensor in mapped:
++                if name.startswith("language_model."):
++                    yield name, tensor
++                else:
++                    others.append((name, tensor))
++
+         loader = AutoWeightsLoader(self)
+-        loaded_params = loader.load_weights(mapped)
++        loaded_params = loader.load_weights(language_model_stream())
++        if others:
++            loaded_params |= loader.load_weights(sorted(others, key=lambda x: x[0]))
+         # The child's load_weights already ran its post-load finalization.
+         self._weights_finalized = True
+         return loaded_params
+--- a/vllm/models/deepseek_v41/attention.py	2026-10-07 19:20:56.366599168 +0200
++++ b/vllm/models/deepseek_v41/attention.py	2026-10-07 19:20:56.612183262 +0200
+@@ -185,6 +185,11 @@
+     deepseek_v41 model module. The base is never instantiated directly.
+     """
+ 
++    # Sliding-window KV cache page size in tokens. Any multiple of 32 for the
++    # FlashMLA kernels; FlashInfer's SM120 sparse-MLA decode kernels are only
++    # instantiated for 64-token pages, so that subclass overrides it.
++    swa_cache_block_size: ClassVar[int] = 32
++
+     # Provided by the platform subclass.
+     backend_cls: ClassVar[type[AttentionBackend]]
+     # Backend for the SWA cache layer; None uses the default SWA backend.
+@@ -561,7 +566,7 @@
+             prefix=f"{prefix}.swa_cache",
+             cache_config=cache_config,
+             backend_cls=self.swa_backend_cls,
+-            block_size=32,
++            block_size=self.swa_cache_block_size,
+             packed_bytes_per_token=self.swa_bytes_per_token,
+             packed_page_alignment=self.kv_page_alignment,
+             bounded_replay=swa_bounded_replay,
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:56.886533940 +0200
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:57.144891274 +0200
+@@ -115,7 +115,10 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [128]
++        # The SM120 sparse-MLA decode kernels take the compressed pages at any
++        # size (DeepSeek-V4 serves 32-row pages through them); 64 is what the
++        # V4.1 indexer needs on SM120, see DeepseekV41IndexerBackend.
++        return [64, 128]
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -592,6 +595,9 @@
+ 
+     backend_cls = DeepseekV4FlashInferMLASparseBackend
+     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
++    # The SM120 sparse-MLA decode kernels (flashinfer 0.7.0) exist for
++    # page_block_size=64 only; a 32-token SWA page fails at the first forward.
++    swa_cache_block_size: ClassVar[int] = 64
+     use_fp8_ds_mla_layout: ClassVar[bool] = True
+ 
+     @staticmethod
+--- a/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.401591948 +0200
++++ b/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.688192638 +0200
+@@ -86,11 +86,13 @@
+                 "aiter with VLLM_ROCM_USE_AITER=1."
+             )
+         return True
+-    if use_fp4 and not current_platform.is_device_capability_family(100):
++    if use_fp4 and not (
++        current_platform.is_device_capability_family(100)
++        or current_platform.is_device_capability_family(120)
++    ):
+         raise ValueError(
+-            "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
+-            "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
+-            "earlier architectures are not supported."
++            "indexer_kv_dtype='mxfp4' requires Blackwell GPUs (sm_10x or "
++            "sm_120); earlier architectures are not supported."
+         )
+     return use_fp4
+ 
+@@ -297,7 +299,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        # The indexer page of a compress_ratio=1 layer holds block_size rows,
++        # and DeepGEMM's paged MQA logits take 32- or 64-row pages everywhere
++        # but on SM100 (the sparse-indexer kernels). 64 keeps the ratio-1
++        # layers at 64 rows and the ratio-2 layers at 32.
++        return [128 if current_platform.is_device_capability_family(100) else 64]
+ 
+ 
+ @dataclass(frozen=True)

@@ -20,6 +20,7 @@ start)
   R="${2:?usage: node-v41.sh start <rank 0-3>}"
   [ -f "$MODEL_DIR/model.safetensors.index.json" ] || { echo "geen index in $MODEL_DIR"; exit 1; }
   [ -f "$NCCL_DIR/libnccl.so.2" ] || { echo "patched NCCL ontbreekt: $NCCL_DIR"; exit 1; }
+  [ -f "$HOME/vllm-cache/no-merge.jinja" ] || printf '%s\n' "{% for m in messages %}{{ m['content'] }}{% endfor %}" > "$HOME/vllm-cache/no-merge.jinja"
   if docker ps --format '{{.Names}}' | grep -qx gb10-llm; then echo "gb10-llm draait nog: eerst node.sh stop"; exit 1; fi
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   if [ "$R" = 0 ]; then TAIL=(--host 0.0.0.0 --port "$PORT"); else TAIL=(--headless); fi
@@ -36,12 +37,15 @@ start)
     -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN \
     -e VLLM_ONE_GPU_PER_NODE=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+    -e VLLM_SAFETENSORS_CLONE_ON_LOAD=1 \
     "$IMAGE" /model --served-model-name "$SERVED_NAME" \
     --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" \
     --master-addr "$HEAD_IP" --master-port 29521 --distributed-executor-backend mp \
-    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$GPU_UTIL" \
+    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$GPU_UTIL" --max-num-batched-tokens 2048 --max-num-seqs 16 \
     --trust-remote-code --language-model-only \
     --kernel-config '{"enable_flashinfer_autotune":false}' \
+    --chat-template /root/.cache/no-merge.jinja \
+    --attention-config '{"indexer_kv_dtype": "mxfp4"}' \
     --engram-config '{"disk_offload": true, "disk_offload_threads": 64}' \
     --reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41 \
     "${TAIL[@]}" >/dev/null
