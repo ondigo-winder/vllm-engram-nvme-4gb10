@@ -12,5 +12,5 @@ RUN cd ${VLLM_DIR} && patch -p1 --forward < /tmp/0001-engram-disk-offload.patch 
  && python3 -m py_compile vllm/config/engram.py vllm/models/deepseek_v41/common/engram.py \
       vllm/model_executor/model_loader/weight_utils.py vllm/models/deepseek_v41/nvidia/vl_model.py \
       vllm/models/deepseek_v41/attention.py vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py \
-      vllm/v1/attention/backends/mla/indexer.py \
+      vllm/v1/attention/backends/mla/indexer.py vllm/models/deepseek_v41/quant_config.py \
  && rm /tmp/0001-engram-disk-offload.patch /tmp/0002-sm120-deepseek-v41-page-sizes.patch

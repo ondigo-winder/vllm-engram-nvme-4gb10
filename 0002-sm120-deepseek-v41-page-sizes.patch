@@ -90,7 +90,7 @@
              head_size=self.head_dim,
              dtype=self.dtype,
 --- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:56.886533940 +0200
-+++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 19:20:57.144891274 +0200
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-10-07 22:31:28.241318752 +0200
 @@ -115,7 +115,10 @@
  
      @staticmethod
@@ -103,7 +103,26 @@
  
      @staticmethod
      def get_name() -> str:
-@@ -592,6 +595,9 @@
+@@ -587,11 +590,28 @@
+             )
+ 
+ 
++def _sm120_fill_masked_indices(indices: torch.Tensor) -> torch.Tensor:
++    """Replace -1 (masked) sparse indices by a slot the row already reads.
++
++    The sm_120 sparse-MLA kernels still fetch a KV row for a masked index --
++    block 0 -- and multiply it by a zero probability, so any NaN byte in the
++    null block poisons the row (warmup and padded rows leave such bytes
++    there). Pointing the masked entries at the row's first valid slot keeps
++    every read inside rows that hold finite data; `topk_lens` masks them.
++    """
++    first = indices[..., :1]
++    safe = torch.where(first >= 0, first, torch.zeros_like(first))
++    return torch.where(indices >= 0, indices, safe.expand_as(indices))
++
++
+ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+     """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
  
      backend_cls = DeepseekV4FlashInferMLASparseBackend
      swa_backend_cls = DeepseekSparseSWAFlashInferBackend
@@ -113,6 +132,32 @@
      use_fp8_ds_mla_layout: ClassVar[bool] = True
  
      @staticmethod
+@@ -805,6 +825,9 @@
+         swa_lens = swa_metadata.decode_swa_lens
+         assert swa_indices is not None
+         assert swa_lens is not None
++        swa_indices = _sm120_fill_masked_indices(swa_indices[:num_decode_tokens])
++        if extra_sparse_indices is not None:
++            extra_sparse_indices = _sm120_fill_masked_indices(extra_sparse_indices)
+         q = self._prepare_query(q, output)
+         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
+         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
+@@ -921,8 +944,14 @@
+             )
+ 
+             q_chunk = q[query_start:query_end]
+-            swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
++            swa_indices_chunk = _sm120_fill_masked_indices(
++                swa_metadata.prefill_swa_indices[query_start:query_end]
++            )
+             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
++            if extra_sparse_indices_chunk is not None:
++                extra_sparse_indices_chunk = _sm120_fill_masked_indices(
++                    extra_sparse_indices_chunk
++                )
+             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
+                 raise RuntimeError(
+                     "Compressed sparse MLA prefill requires compressed sparse indices."
 --- a/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 19:20:57.401591948 +0200
 +++ b/vllm/v1/attention/backends/mla/indexer.py	2026-10-07 20:21:27.889746108 +0200
 @@ -86,11 +86,13 @@
@@ -184,3 +229,69 @@
          # Compare actual vs estimated CUDA graph memory (if we did profiling)
          if (
              hasattr(self, "cudagraph_memory_estimate")
+--- a/vllm/models/deepseek_v41/quant_config.py	2026-10-07 23:35:06.555401002 +0200
++++ b/vllm/models/deepseek_v41/quant_config.py	2026-10-07 23:35:22.369150569 +0200
+@@ -16,6 +16,7 @@
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
++from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     is_layer_skipped,
+     kMxfp8Dynamic,
+@@ -103,6 +104,44 @@
+         self._resolve_moe_overrides()
+         return self._resolved_moe_quant_algo or ""
+ 
++    def _routed_experts_are_nvfp4(self, prefix: str) -> bool:
++        """Whether the checkpoint stores this layer's routed experts as NVFP4.
++
++        ModelOpt's NVFP4 export quantizes the backbone experts only: its
++        ``quantized_layers`` lists ``layers.N.ffn.experts`` and ``ignore``
++        holds ``mtp.*``, so the MTP/DSpark draft experts keep the original
++        MXFP4 tensors (``w1.weight`` int8 + ``w1.scale`` e8m0). vLLM builds
++        those draft layers as ``layers.{num_hidden_layers + i}``; give them
++        the MXFP4 method or they load NVFP4 scales that are not there.
++        """
++        try:
++            hf_config = get_current_vllm_config().model_config.hf_config
++        except Exception:
++            return True
++        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
++        quantized = quant_cfg.get("quantized_layers") or {}
++        if not isinstance(quantized, dict) or not quantized:
++            return True
++        try:
++            idx = extract_layer_index(prefix)
++        except Exception:
++            return True
++        num_layers = getattr(hf_config, "num_hidden_layers", None)
++        if num_layers is not None and idx >= num_layers:
++            name = f"mtp.{idx - num_layers}.ffn.experts"
++        else:
++            name = f"layers.{idx}.ffn.experts"
++        nvfp4 = any(k == name or k.startswith(name + ".") for k in quantized)
++        if not nvfp4:
++            from vllm.logger import init_logger
++
++            init_logger(__name__).info_once(
++                "DeepSeek V4 routed experts %s are not NVFP4 in this "
++                "checkpoint; using the MXFP4 expert method for them.",
++                name,
++            )
++        return nvfp4
++
+     def _get_nvfp4_config(self) -> ModelOptNvFp4Config:
+         if self._nvfp4_config is None:
+             from vllm.model_executor.layers.quantization.modelopt import (
+@@ -216,7 +255,9 @@
+             ):
+                 return UnquantizedFusedMoEMethod(layer.moe_config)
+             if self.expert_dtype == "fp4":
+-                if self.moe_quant_algo == "NVFP4":
++                if self.moe_quant_algo == "NVFP4" and self._routed_experts_are_nvfp4(
++                    prefix
++                ):
+                     from vllm.model_executor.layers.quantization.modelopt import (
+                         ModelOptNvFp4FusedMoE,
+                     )

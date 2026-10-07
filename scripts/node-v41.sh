@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # DeepSeek-V4.1-Flash on the 4x GB10 ring cluster, Engram tables served from NVMe.
-#   node-v41.sh start <rank>   (0 = head with the API on :8001, 1-3 = workers)
+#   node-v41.sh start <rank>   (0 = head with the API on :8000, 1-3 = workers)
 #   node-v41.sh stop | status
-# Starts on port 8001 and container name gb10-v41 so it can coexist on disk with the
-# V4-Flash service (gb10-llm, :8000) — but NOT in memory: stop gb10-llm first.
+# Container name gb10-v41; serves the production port 8000 (the V4-Flash gb10-llm service, node.sh,
+# is the fallback and must be stopped first: both do not fit in memory).
 set -euo pipefail
 MODEL_DIR="$HOME/models/DeepSeek-V4.1-Flash-NVFP4"
 SERVED_NAME="deepseek-v4.1-flash"
 IMAGE="${IMAGE:-vllm-engram-nvme:latest}"
 NCCL_DIR="$HOME/nccl-switchless-4hca"
 HEAD_IP="192.168.1.101"
-PORT=8001
-MAX_LEN="${MAX_LEN:-131072}"
+PORT="${PORT:-8000}"
+MAX_LEN="${MAX_LEN:-262144}"
 GPU_UTIL="${GPU_UTIL:-0.80}"
 CONTAINER="gb10-v41"
 mgmt_ip() { ip -4 -br addr show enP7s7 | awk '{print $3}' | cut -d/ -f1; }
@@ -38,13 +38,14 @@ start)
     -e VLLM_ONE_GPU_PER_NODE=1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e VLLM_SAFETENSORS_CLONE_ON_LOAD=1 \
-    "$IMAGE" /model --served-model-name "$SERVED_NAME" \
+    "$IMAGE" /model --served-model-name "$SERVED_NAME" deepseek-v4-flash \
     --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" \
     --master-addr "$HEAD_IP" --master-port 29521 --distributed-executor-backend mp \
     --max-model-len "$MAX_LEN" --gpu-memory-utilization "$GPU_UTIL" --max-num-batched-tokens 2048 --max-num-seqs 16 \
     --trust-remote-code --language-model-only \
     --kernel-config '{"enable_flashinfer_autotune":false}' \
     --chat-template /root/.cache/no-merge.jinja \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}' \
     --engram-config '{"disk_offload": true, "disk_offload_threads": 64}' \
     --reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41 \
     "${TAIL[@]}" >/dev/null

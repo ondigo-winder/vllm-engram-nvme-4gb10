@@ -58,10 +58,33 @@ Result: "The capital of France is" → " Paris."; a 12,242-token prompt with a
 hidden password is answered correctly from reasoning; reasoning output is
 coherent. Single-stream decode ~24 tok/s, 12k-token prefill ~10 s.
 
-## Open
+## Third pass: DSpark
 
-DSpark, tool-call / `/v1/messages` parsing, concurrency, long-run stability
-and real measurements are next.
+With `--speculative-config '{"method":"dspark","num_speculative_tokens":7}'`
+the output stayed correct but acceptance was ~1% (V4-Flash on the same
+cluster: mean acceptance length 4.2). A debug print in the drafter showed
+its backbone output at ~1e34, and a list of parameters the draft loader never
+touched: `routed_experts.w13_weight_scale_2`, `w13_input_scale`,
+`w2_weight_scale_2`, `w2_input_scale` for all three draft layers — the NVFP4
+global scales. The checkpoint's `hf_quant_config.json` quantizes only
+`layers.N.ffn.experts` and lists `mtp.*` under `ignore`; the draft experts are
+MXFP4 (`mtp.0.ffn.experts.0.w1.weight` I8 [2304, 2560], `.scale` F8_E8M0
+[2304, 160]) while the backbone experts are NVFP4 (U8 + E4M3 block-16 scales
++ `weight_scale_2` + `input_scale`). `DeepseekV4FP8Config.get_quant_method`
+handed every `RoutedExperts` the NVFP4 method. Fixed by checking
+`quantized_layers` per layer (`mtp.{i}.ffn.experts` for the draft layers
+`layers.{num_hidden_layers + i}`) and using `Mxfp4MoEMethod` otherwise —
+vLLM then picks the `DEEPGEMM_MXFP4` backend for them on GB10.
+
+Result: mean acceptance length 2.95 (essays), 3.49 (Python), 7.4 (repetitive
+text); single-stream 27.6 tok/s prose, ~48 tok/s code; 4 streams 74 tok/s.
+The 12k-token needle test still passes with DSpark on.
+
+## In service
+
+`scripts/node-v41.sh` now serves port 8000 with 262144 context, DSpark on,
+and `deepseek-v4-flash` as an alias of the served model name so the existing
+router keeps working. `node.sh` (V4-Flash) is the fallback.
 
 ## First session (2026-10-07, before the fixes above)
 

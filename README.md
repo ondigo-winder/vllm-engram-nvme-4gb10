@@ -2,15 +2,17 @@
 
 **Run DeepSeek-V4.1-Flash on four DGX Spark / GB10 boxes by serving its Engram tables from NVMe instead of RAM.**
 
-> Status: **working on the 4x GB10 cluster (2026-10-07).** DeepSeek-V4.1-Flash
-> loads in 74.9 GiB per node with both Engram tables served from NVMe, vLLM
-> reports a 4.0M-token KV cache, and the model answers correctly (short
-> prompts, a 12k-token needle-in-a-haystack, reasoning). Getting there also
-> needed `0002-sm120-deepseek-v41-page-sizes.patch`: V4.1 was not runnable
-> on sm_120 (GB10 / DGX Spark) with this vLLM nightly at all, for reasons
-> unrelated to Engram — see [docs/test-results.md](docs/test-results.md).
-> Not yet done: DSpark, tool calls through the parsers, throughput numbers,
-> long-running stability.
+> Status: **in service on the 4x GB10 cluster (2026-10-07).** DeepSeek-V4.1-Flash
+> loads in 74.9 GiB per node with both Engram tables served from NVMe, answers
+> correctly (short prompts, a 12k-token needle-in-a-haystack, reasoning, tool
+> calls, `/v1/messages` with thinking), runs DSpark speculative decoding
+> (mean acceptance length 3–3.5 on prose and code) and serves 262k context.
+> Single-stream decode ~28 tok/s on prose and ~48 tok/s on code with DSpark;
+> ~74 tok/s aggregate at 4 streams. Getting there needed
+> `0002-sm120-deepseek-v41-page-sizes.patch`: V4.1 was not runnable on
+> sm_120 (GB10 / DGX Spark) with this vLLM nightly, and its DSpark drafter
+> loaded the wrong expert format on every platform — see
+> [docs/test-results.md](docs/test-results.md).
 
 ## The problem
 
@@ -125,8 +127,8 @@ docs/
   same group, so each shard is released as soon as it is consumed.
 
 `0002-sm120-deepseek-v41-page-sizes.patch` — makes DeepSeek-V4.1 run on
-sm_120 at all (five files, nothing to do with Engram; needed on GB10 / DGX
-Spark, harmless elsewhere):
+sm_120 at all (six files, nothing to do with Engram; needed on GB10 / DGX
+Spark, harmless elsewhere, and the DSpark fix applies everywhere):
 
 * 64-token sliding-window pages for the SM120 FlashInfer attention class
   (its sparse-MLA decode kernels only exist for 64-token pages; V4.1 used 32).
@@ -142,6 +144,17 @@ Spark, harmless elsewhere):
   block 0 for every masked (-1) index and multiply by a zero probability,
   which turned every partially filled attention row into NaN. Finding this
   took most of the day; the kernel-level fix belongs in FlashInfer.
+* Masked (-1) sparse indices are pointed at the row's first valid slot
+  before the sm_120 kernels run, so no masked read touches the null block.
+* **DSpark draft experts load as MXFP4.** NVIDIA's NVFP4 export quantizes
+  only the backbone experts (`quantized_layers` lists `layers.N.ffn.experts`,
+  `ignore` holds `mtp.*`); the draft's experts stay in DeepSeek's MXFP4
+  format (`w1.weight` int8 + `w1.scale` e8m0). vLLM gave every
+  `RoutedExperts` the NVFP4 method, so the drafter loaded MXFP4 bytes as
+  NVFP4 and left its global scales uninitialized (hidden states ~1e34,
+  draft acceptance 1%). `DeepseekV4FP8Config` now checks the checkpoint's
+  `quantized_layers` per layer and uses `Mxfp4MoEMethod` for the draft
+  layers. This one is not sm_120-specific.
 * `indexer_kv_dtype=mxfp4` is allowed on sm_120 (DeepGEMM 2.8 ships the
   kernels); not needed with the per-layer block sizes, FP8 is the default.
 
@@ -188,18 +201,17 @@ Requirements and caveats:
 
 ## Roadmap
 
-1. Measure: decode and prefill against V4-Flash on the same cluster and the
-   in-memory numbers NVIDIA publishes for GB300; page-cache hit rates on
-   real coding traffic. First numbers: ~24 tok/s single-stream decode,
-   a 12k-token prompt prefills in ~10 s.
-2. DSpark speculative decoding (`--speculative-config` with `method: dspark`),
-   tool-call and `/v1/messages` parsing, multi-request stability.
-3. Prefetch: the hash ids are known before the decoder runs, so the gather for
+1. Measure properly: decode and prefill against V4-Flash on the same cluster
+   and the in-memory numbers NVIDIA publishes for GB300; page-cache hit rates
+   on real coding traffic. First numbers above.
+2. Prefetch: the hash ids are known before the decoder runs, so the gather for
    step *t+1* can start while step *t* computes (and for DSpark drafts).
+3. Prefill throughput: `--max-num-batched-tokens` is 2048 in the launcher
+   (a 12k-token prompt takes ~10 s); larger chunks need a memory check.
 4. Engram DP sharding support (`engram_dp_size > 1`).
-5. Upstream: the `vl_model.py` streaming load and the null-block fix are bugs
-   on their own; the per-layer block sizes and `cpu_offload="disk"` are
-   proposals.
+5. Upstream: the `vl_model.py` streaming load, the null-block zeroing and the
+   DSpark expert-format fix are bugs on their own; the per-layer block sizes
+   and `cpu_offload="disk"` are proposals.
 
 ## Credits
 
